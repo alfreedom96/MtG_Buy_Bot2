@@ -20,7 +20,7 @@ jobs:
       - name: Checkout repository dati (privato)
         uses: actions/checkout@v4
         with:
-          repository: TUO_UTENTE/NOME_REPO_DATI_PRIVATO
+          repository: alfreedom96/MtG_Buy_Bot_data
           token: ${{ secrets.DATA_REPO_TOKEN }}
           path: data
 
