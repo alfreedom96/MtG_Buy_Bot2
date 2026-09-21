@@ -1,0 +1,67 @@
+name: Controllo prezzi CardTrader
+
+on:
+  schedule:
+    # Rete di sicurezza: lo scheduler interno di GitHub non è affidabile
+    # per intervalli brevi, quindi il trigger principale ora è esterno
+    # (cron-job.org chiama direttamente workflow_dispatch ogni ora). Questo
+    # schedule più rado resta solo come backup in caso il servizio esterno
+    # smetta di funzionare.
+    - cron: "0 */4 * * *"
+  workflow_dispatch: {}  # permette di lanciarlo manualmente da GitHub o da un servizio esterno
+
+jobs:
+  check-prices:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (codice pubblico)
+        uses: actions/checkout@v4
+
+      - name: Checkout repository dati (privato)
+        uses: actions/checkout@v4
+        with:
+          repository: TUO_UTENTE/NOME_REPO_DATI_PRIVATO
+          token: ${{ secrets.DATA_REPO_TOKEN }}
+          path: data
+
+      - name: Imposta Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installa dipendenze
+        run: pip install -r requirements.txt
+
+      - name: Esegui controllo prezzi
+        env:
+          CARDTRADER_TOKEN: ${{ secrets.CARDTRADER_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SHEET_CSV_URL: ${{ secrets.SHEET_CSV_URL }}
+          DEFAULT_PERCENTILE_SOGLIA: "15"
+        run: python check_prices.py
+
+      - name: Salva lo storico prezzi nel repository dati privato
+        run: |
+          cd data
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add price_history.json
+          git diff --quiet --cached || git commit -m "Aggiorna storico prezzi [skip ci]"
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin main && git push && break
+            echo "Push fallito (probabile scontro con un altro workflow), ritento tra 5s... ($i/5)"
+            sleep 5
+          done
+
+      - name: Segnala successo a healthchecks.io
+        if: success() && env.HEALTHCHECKS_URL != ''
+        env:
+          HEALTHCHECKS_URL: ${{ secrets.HEALTHCHECKS_URL }}
+        run: curl -fsS -m 10 --retry 3 -o /dev/null "$HEALTHCHECKS_URL" || true
+
+      - name: Segnala fallimento a healthchecks.io
+        if: failure() && env.HEALTHCHECKS_URL != ''
+        env:
+          HEALTHCHECKS_URL: ${{ secrets.HEALTHCHECKS_URL }}
+        run: curl -fsS -m 10 --retry 3 -o /dev/null "$HEALTHCHECKS_URL/fail" || true

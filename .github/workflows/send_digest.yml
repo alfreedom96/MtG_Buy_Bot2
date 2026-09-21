@@ -1,0 +1,35 @@
+name: Riepilogo settimanale CardTrader
+
+on:
+  schedule:
+    # Ogni lunedì alle 8:00 UTC. Modifica a piacere.
+    - cron: "0 8 * * 1"
+  workflow_dispatch: {}  # permette di lanciarlo manualmente da GitHub
+
+jobs:
+  send-digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (codice pubblico)
+        uses: actions/checkout@v4
+
+      - name: Checkout repository dati (privato, sola lettura)
+        uses: actions/checkout@v4
+        with:
+          repository: TUO_UTENTE/NOME_REPO_DATI_PRIVATO
+          token: ${{ secrets.DATA_REPO_TOKEN }}
+          path: data
+
+      - name: Imposta Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installa dipendenze
+        run: pip install -r requirements.txt
+
+      - name: Invia riepilogo
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python send_digest.py
