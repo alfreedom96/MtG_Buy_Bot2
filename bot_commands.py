@@ -8,6 +8,8 @@ comandi supportati:
     /help                 elenca i comandi disponibili
     /riepilogo            manda subito il riepilogo di tutte le carte
     /grafico <nome carta> manda un grafico dell'andamento storico del prezzo
+                          (se ci sono più varianti, es. foil e non-foil, le
+                          manda tutte)
 
 Può essere invocato in due modi:
 1. Da un webhook Telegram (tramite un Cloudflare Worker) che passa il testo
@@ -40,7 +42,7 @@ from common import (
     nome_da_chiave,
     salva_offset_telegram,
 )
-from send_digest import costruisci_righe_riepilogo, invia_a_blocchi
+from send_digest import costruisci_blocchi_riepilogo, invia_a_blocchi
 
 TESTO_HELP = (
     "Comandi disponibili:\n"
@@ -104,8 +106,8 @@ def gestisci_comando(testo, tg_token, tg_chat_id, storico):
         invia_telegram(tg_token, tg_chat_id, TESTO_HELP)
 
     elif comando == "/riepilogo":
-        righe = costruisci_righe_riepilogo(storico)
-        invia_a_blocchi(tg_token, tg_chat_id, "📊 Riepilogo prezzi carte monitorate", righe)
+        blocchi = costruisci_blocchi_riepilogo(storico)
+        invia_a_blocchi(tg_token, tg_chat_id, "📊 Riepilogo prezzi carte monitorate", blocchi)
 
     elif comando == "/grafico":
         if not argomento:
