@@ -26,7 +26,7 @@ TELEGRAM_OFFSET_FILE = os.path.join(DATA_DIR, "telegram_offset.json")
 
 CONDIZIONI_ACCETTATE = {"Mint", "Near Mint", "Slightly Played"}
 MINIMO_PUNTI_PER_STATISTICA = 5
-MAX_PUNTI_STORICO = 1000  # limite per non far crescere il file all'infinito
+MAX_PUNTI_STORICO = 5000  # limite per non far crescere il file all'infinito
 SOGLIA_FALLIMENTI_CONSECUTIVI = 10  # dopo quanti fallimenti di fila avvisare
 
 
