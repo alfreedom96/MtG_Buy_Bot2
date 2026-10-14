@@ -5,6 +5,7 @@ CardTrader Price Watch - comandi Telegram
 Controlla se sono arrivati nuovi messaggi al bot Telegram e risponde ai
 comandi supportati:
 
+    qualunque testo       mostra l'help con i bottoni cliccabili
     /help                 elenca i comandi disponibili
     /riepilogo            manda subito il riepilogo di tutte le carte
     /grafico <nome carta> manda un grafico dell'andamento storico del prezzo
@@ -23,6 +24,7 @@ Ignora messaggi che non provengono dalla chat configurata in
 TELEGRAM_CHAT_ID, per sicurezza (è un bot personale).
 """
 
+import hashlib
 import io
 import os
 from datetime import datetime
@@ -40,17 +42,65 @@ from common import (
     invia_telegram_foto,
     leggi_messaggi_telegram,
     nome_da_chiave,
+    rispondi_callback,
     salva_offset_telegram,
 )
-from send_digest import costruisci_blocchi_riepilogo, invia_a_blocchi
+from send_digest import costruisci_blocchi_riepilogo, formatta_nome, invia_a_blocchi
 
 TESTO_HELP = (
-    "Comandi disponibili:\n"
-    "/riepilogo - riepilogo di tutte le carte monitorate\n"
-    "/grafico Nome Carta - grafico dell'andamento storico del prezzo "
-    "(se tieni più varianti della stessa carta, es. foil e non-foil, le manda tutte)\n"
-    "/help - questo messaggio"
+    "👋 <b>Cosa vuoi fare?</b>\n"
+    "Tocca un bottone qui sotto.\n\n"
+    "📊 <b>Riepilogo</b> - prezzi di tutte le carte monitorate\n"
+    "📈 <b>Grafico</b> - scegli una carta e vedi l'andamento del prezzo\n\n"
+    "<i>Puoi anche scrivere /grafico Nome Carta.</i>"
 )
+
+TASTIERA_HELP = [[("📊 Riepilogo", "riepilogo"), ("📈 Grafico", "grafici:0")]]
+CARTE_PER_PAGINA = 30
+
+
+def nomi_carte(storico):
+    """Nomi unici (minuscoli) delle carte nello storico, in ordine alfabetico."""
+    return sorted({nome_da_chiave(k).strip().lower() for k in storico})
+
+
+def id_carta(nome):
+    """Identificativo corto (callback_data Telegram max 64 byte)."""
+    return hashlib.sha1(nome.strip().lower().encode("utf-8")).hexdigest()[:10]
+
+
+def invia_help(tg_token, tg_chat_id):
+    invia_telegram(tg_token, tg_chat_id, TESTO_HELP, tastiera=TASTIERA_HELP)
+
+
+def invia_elenco_carte(tg_token, tg_chat_id, storico, pagina=0):
+    nomi = nomi_carte(storico)
+    if not nomi:
+        invia_telegram(tg_token, tg_chat_id, "Non ci sono ancora carte monitorate.", tastiera=TASTIERA_HELP)
+        return
+    n_pagine = (len(nomi) + CARTE_PER_PAGINA - 1) // CARTE_PER_PAGINA
+    pagina = max(0, min(pagina, n_pagine - 1))
+    fetta = nomi[pagina * CARTE_PER_PAGINA:(pagina + 1) * CARTE_PER_PAGINA]
+    righe, riga = [], []
+    for nome in fetta:
+        riga.append((formatta_nome(nome), f"g:{id_carta(nome)}"))
+        if len(riga) == 2:
+            righe.append(riga)
+            riga = []
+    if riga:
+        righe.append(riga)
+    nav = []
+    if pagina > 0:
+        nav.append(("⬅️ Indietro", f"grafici:{pagina - 1}"))
+    if pagina < n_pagine - 1:
+        nav.append(("Avanti ➡️", f"grafici:{pagina + 1}"))
+    if nav:
+        righe.append(nav)
+    righe.append([("🏠 Menu", "menu")])
+    titolo = "📈 <b>Di quale carta vuoi il grafico?</b>"
+    if n_pagine > 1:
+        titolo += f" (pagina {pagina + 1}/{n_pagine})"
+    invia_telegram(tg_token, tg_chat_id, titolo, tastiera=righe)
 
 
 def trova_record_per_nome(storico, nome_richiesto):
@@ -97,48 +147,79 @@ def genera_grafico(chiave, record):
     return buf
 
 
+def invia_grafici(tg_token, tg_chat_id, nome, candidati):
+    candidati_validi = [
+        (chiave, record) for chiave, record in candidati
+        if len(record.get("rilevazioni", [])) >= 2
+    ]
+    if not candidati_validi:
+        invia_telegram(
+            tg_token, tg_chat_id,
+            f"Non ho ancora abbastanza dati storici per '{nome}'. "
+            f"Controlla di aver scritto il nome esatto come nel foglio.",
+            tastiera=[[("📈 Altre carte", "grafici:0"), ("🏠 Menu", "menu")]],
+        )
+        return
+    import tempfile
+    for i, (chiave, record) in enumerate(candidati_validi):
+        buf = genera_grafico(chiave, record)
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp.write(buf.read())
+            percorso = tmp.name
+        try:
+            didascalia = f"{formatta_nome(nome_da_chiave(chiave))} ({etichetta_variante(chiave)})"
+            ultimo = i == len(candidati_validi) - 1
+            invia_telegram_foto(
+                tg_token, tg_chat_id, percorso, didascalia=didascalia,
+                tastiera=[[("📈 Altre carte", "grafici:0"), ("🏠 Menu", "menu")]] if ultimo else None,
+            )
+        finally:
+            os.remove(percorso)
+
+
 def gestisci_comando(testo, tg_token, tg_chat_id, storico):
-    comando, _, argomento = testo.strip().partition(" ")
+    """Gestisce sia i comandi testuali (/grafico ...) sia i click sui bottoni
+    (che arrivano come 'cb:<dati>'). Qualunque altro testo mostra l'help."""
+    testo = testo.strip()
+
+    if testo.startswith("cb:"):
+        dati = testo[3:]
+        if dati == "riepilogo":
+            blocchi = costruisci_blocchi_riepilogo(storico)
+            invia_a_blocchi(tg_token, tg_chat_id, "📊 Riepilogo prezzi carte monitorate", blocchi)
+        elif dati.startswith("grafici:"):
+            try:
+                pagina = int(dati.split(":", 1)[1])
+            except ValueError:
+                pagina = 0
+            invia_elenco_carte(tg_token, tg_chat_id, storico, pagina)
+        elif dati.startswith("g:"):
+            cid = dati[2:]
+            nome = next((n for n in nomi_carte(storico) if id_carta(n) == cid), None)
+            if nome is None:
+                invia_telegram(tg_token, tg_chat_id, "Questa carta non è più monitorata. Ecco l'elenco aggiornato:")
+                invia_elenco_carte(tg_token, tg_chat_id, storico, 0)
+            else:
+                invia_grafici(tg_token, tg_chat_id, nome, trova_record_per_nome(storico, nome))
+        else:  # "menu" o sconosciuto
+            invia_help(tg_token, tg_chat_id)
+        return
+
+    comando, _, argomento = testo.partition(" ")
     comando = comando.lower()
     argomento = argomento.strip()
 
-    if comando in ("/help", "/start"):
-        invia_telegram(tg_token, tg_chat_id, TESTO_HELP)
-
-    elif comando == "/riepilogo":
+    if comando == "/riepilogo":
         blocchi = costruisci_blocchi_riepilogo(storico)
         invia_a_blocchi(tg_token, tg_chat_id, "📊 Riepilogo prezzi carte monitorate", blocchi)
-
     elif comando == "/grafico":
         if not argomento:
-            invia_telegram(tg_token, tg_chat_id, "Usa: /grafico Nome Carta")
-            return
-        candidati = trova_record_per_nome(storico, argomento)
-        candidati_validi = [
-            (chiave, record) for chiave, record in candidati
-            if len(record.get("rilevazioni", [])) >= 2
-        ]
-        if not candidati_validi:
-            invia_telegram(
-                tg_token, tg_chat_id,
-                f"Non ho ancora abbastanza dati storici per '{argomento}'. "
-                f"Controlla di aver scritto il nome esatto come nel foglio."
-            )
-            return
-        import tempfile, os as _os
-        for chiave, record in candidati_validi:
-            buf = genera_grafico(chiave, record)
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                tmp.write(buf.read())
-                percorso = tmp.name
-            try:
-                didascalia = f"{nome_da_chiave(chiave)} ({etichetta_variante(chiave)})"
-                invia_telegram_foto(tg_token, tg_chat_id, percorso, didascalia=didascalia)
-            finally:
-                _os.remove(percorso)
-
+            invia_elenco_carte(tg_token, tg_chat_id, storico, 0)
+        else:
+            invia_grafici(tg_token, tg_chat_id, argomento, trova_record_per_nome(storico, argomento))
     else:
-        invia_telegram(tg_token, tg_chat_id, "Comando non riconosciuto. Scrivi /help per la lista.")
+        # /help, /start, comandi sconosciuti e qualunque testo libero
+        invia_help(tg_token, tg_chat_id)
 
 
 def main():
@@ -171,16 +252,24 @@ def main():
 
     for update in messaggi:
         ultimo_offset = update["update_id"] + 1
-        messaggio = update.get("message") or update.get("edited_message")
-        if not messaggio:
-            continue
-        chat_id_mittente = str(messaggio.get("chat", {}).get("id"))
-        testo = messaggio.get("text", "")
-        if chat_id_mittente != tg_chat_id:
-            print(f"Messaggio ignorato da chat non autorizzata: {chat_id_mittente}")
-            continue
-        if not testo.startswith("/"):
-            continue
+        cb = update.get("callback_query")
+        if cb:
+            chat_id_mittente = str((cb.get("message") or {}).get("chat", {}).get("id"))
+            if chat_id_mittente != tg_chat_id:
+                continue
+            rispondi_callback(tg_token, cb["id"])
+            testo = "cb:" + (cb.get("data") or "menu")
+        else:
+            messaggio = update.get("message") or update.get("edited_message")
+            if not messaggio:
+                continue
+            chat_id_mittente = str(messaggio.get("chat", {}).get("id"))
+            testo = messaggio.get("text", "")
+            if chat_id_mittente != tg_chat_id:
+                print(f"Messaggio ignorato da chat non autorizzata: {chat_id_mittente}")
+                continue
+            if not testo:
+                continue
         print(f"Comando ricevuto: {testo}")
         try:
             gestisci_comando(testo, tg_token, tg_chat_id, storico)
