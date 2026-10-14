@@ -26,7 +26,7 @@ TELEGRAM_OFFSET_FILE = os.path.join(DATA_DIR, "telegram_offset.json")
 
 CONDIZIONI_ACCETTATE = {"Mint", "Near Mint", "Slightly Played"}
 MINIMO_PUNTI_PER_STATISTICA = 5
-MAX_PUNTI_STORICO = 5000  # limite per non far crescere il file all'infinito
+MAX_PUNTI_STORICO = 5000  # circa 70 giorni con un controllo ogni 20 minuti
 SOGLIA_FALLIMENTI_CONSECUTIVI = 10  # dopo quanti fallimenti di fila avvisare
 
 
@@ -68,6 +68,26 @@ def nome_da_chiave(chiave):
 # Google Sheet
 # ---------------------------------------------------------------------------
 
+def _norm_edizione(token):
+    """Normalizza codice/nome/URL di un'edizione in uno slug confrontabile.
+    'Marvel's Spider-Man Promos' -> 'marvels-spider-man-promos'
+    '.../expansions/pspm/categories' -> 'pspm'"""
+    token = token.strip().lower()
+    m = re.search(r"/expansions/([^/?#]+)", token)
+    if m:
+        token = m.group(1)
+    token = token.replace("'", "").replace("\u2019", "")
+    return re.sub(r"[^a-z0-9]+", "-", token).strip("-")
+
+
+def _lista_edizioni(testo):
+    """'pspm; The Hobbit Collectors' -> ['pspm', 'the-hobbit-collectors'].
+    Accetta codici, nomi o link alla pagina dell'edizione su CardTrader."""
+    if not testo:
+        return []
+    return [_norm_edizione(t) for t in re.split(r"[;|]", testo) if t.strip()]
+
+
 def leggi_lista_carte(sheet_csv_url):
     """Scarica il Google Sheet pubblicato come CSV e restituisce le righe.
 
@@ -76,6 +96,10 @@ def leggi_lista_carte(sheet_csv_url):
       - lingua              (opzionale: it / en / entrambe - default entrambe)
       - foil                (opzionale: si / no / qualsiasi - default si)
       - percentile_soglia   (opzionale: numero 1-100 - default DEFAULT_PERCENTILE_SOGLIA)
+      - soglia_occasione    (opzionale: % di sconto del minimo rispetto alla media
+                             delle 20 offerte più economiche - default DEFAULT_SOGLIA_OCCASIONE)
+      - edizioni_escluse    (opzionale: codici o nomi edizione da ignorare, separati da ; )
+      - edizioni_incluse    (opzionale: se compilata, considera SOLO queste edizioni)
     """
     import csv
     import io
@@ -94,6 +118,9 @@ def leggi_lista_carte(sheet_csv_url):
             "lingua": (row.get("lingua") or "entrambe").lower(),
             "foil": (row.get("foil") or "si").lower(),
             "percentile_soglia": row.get("percentile_soglia") or "",
+            "soglia_occasione": (row.get("soglia_occasione") or "").replace("%", "").replace(",", ".").strip(),
+            "edizioni_escluse": _lista_edizioni(row.get("edizioni_escluse")),
+            "edizioni_incluse": _lista_edizioni(row.get("edizioni_incluse")),
         })
     return righe
 
@@ -106,6 +133,7 @@ class CardTraderClient:
     def __init__(self, token):
         self.headers = {"Authorization": f"Bearer {token}"}
         self._expansions = None
+        self._nomi_espansioni = {}
 
     def _get(self, path, params=None, tentativi=4):
         url = f"{CARDTRADER_BASE}{path}"
@@ -133,10 +161,16 @@ class CardTraderClient:
         """Ritorna {codice_espansione_lower: expansion_id} solo per Magic (game_id=1)."""
         if self._expansions is None:
             data = self._get("/expansions")
-            self._expansions = {
-                e["code"].lower(): e["id"] for e in data if e.get("game_id") == 1 and e.get("code")
+            magic = [e for e in data if e.get("game_id") == 1 and e.get("code")]
+            self._expansions = {e["code"].lower(): e["id"] for e in magic}
+            self._nomi_espansioni = {
+                e["code"].lower(): _norm_edizione(e.get("name") or "") for e in magic
             }
         return self._expansions
+
+    def nome_espansione(self, code):
+        self.espansioni_magic()
+        return self._nomi_espansioni.get(code, "")
 
     def blueprints_per_espansione(self, expansion_id):
         return self._get("/blueprints/export", params={"expansion_id": expansion_id})
@@ -225,7 +259,7 @@ def stampe_scryfall(nome_carta):
     return []
 
 
-def trova_blueprint_ids(ct_client, nome_carta):
+def trova_blueprint_ids(ct_client, nome_carta, escluse=None, incluse=None):
     """Trova tutti i blueprint_id di CardTrader corrispondenti a tutte le
     edizioni della carta, incrociando Scryfall (per sapere in quali set
     è stata stampata) con l'elenco espansioni/blueprint di CardTrader."""
@@ -235,9 +269,29 @@ def trova_blueprint_ids(ct_client, nome_carta):
     nome_lower = pulisci_nome(nome_carta).lower()
 
     expansion_ids_da_controllare = set()
-    for code in set_codes:
-        if code in espansioni:
-            expansion_ids_da_controllare.add(espansioni[code])
+    escluse = escluse or []
+    incluse = incluse or []
+
+    def corrisponde(code, elenco):
+        return _norm_edizione(code) in elenco or ct_client.nome_espansione(code) in elenco
+
+    # Partiamo dai set di Scryfall, ma aggiungiamo anche le edizioni indicate
+    # in "edizioni_incluse" che esistono solo su CardTrader (es. collector
+    # edition speciali, promo) e che Scryfall non elenca per questa carta.
+    codici = set(set_codes)
+    if incluse:
+        for code in espansioni:
+            if corrisponde(code, incluse):
+                codici.add(code)
+
+    for code in codici:
+        if code not in espansioni:
+            continue
+        if corrisponde(code, escluse):
+            continue
+        if incluse and not corrisponde(code, incluse):
+            continue
+        expansion_ids_da_controllare.add(espansioni[code])
 
     for expansion_id in expansion_ids_da_controllare:
         try:
@@ -268,22 +322,41 @@ def foil_da_controllare(foil_richiesto):
     return [True, False]  # qualsiasi
 
 
-def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto):
-    """Cerca il prezzo più basso che rispetta i filtri (condizione Mint/NM,
+def _slugify(testo):
+    testo = testo.lower()
+    testo = testo.replace("'", "").replace("’", "")
+    testo = re.sub(r"[^a-z0-9]+", "-", testo)
+    return testo.strip("-")
+
+
+def link_pagina_carta(nome_carta, nome_espansione):
+    """Costruisce il link diretto alla pagina della carta su CardTrader
+    (es. cardtrader.com/en/cards/nome-carta-espansione). È una ricostruzione
+    euristica basata sullo schema URL osservato sul sito, non garantita al
+    100% per nomi con caratteri particolari."""
+    if not nome_espansione:
+        return None
+    slug = f"{_slugify(nome_carta)}-{_slugify(nome_espansione)}"
+    return f"https://www.cardtrader.com/en/cards/{slug}"
+
+
+def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escluse=None, incluse=None):
+    """Cerca il prezzo più basso che rispetta i filtri (condizione Mint/NM/SP,
     CardTrader Zero). Ritorna (risultato, errore):
       - risultato = (prezzo, dettagli, numero_offerte_valide) se trovato
       - errore = messaggio testuale se non trovato (che include, quando
         possibile, informazioni sul mercato anche fuori dai filtri richiesti,
         solo a scopo informativo)."""
-    blueprint_ids = trova_blueprint_ids(ct_client, nome_carta)
+    blueprint_ids = trova_blueprint_ids(ct_client, nome_carta, escluse, incluse)
     if not blueprint_ids:
-        return None, "nessuna edizione trovata su CardTrader"
+        return None, "nessuna edizione trovata su CardTrader (o tutte escluse dai filtri edizione)"
 
     lingue = lingue_da_controllare(lingua_richiesta)
     foils = foil_da_controllare(foil_richiesto)
 
     miglior = None  # (prezzo_eur, dettagli)
     numero_offerte_valide = 0
+    prezzi_validi = []
     # per il messaggio informativo se non troviamo nulla nelle condizioni richieste
     miglior_altre_condizioni = None
 
@@ -302,6 +375,16 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto):
                         continue  # richiesto CardTrader Zero
                     if user.get("on_vacation"):
                         continue
+
+                    exp = p.get("expansion") or {}
+                    exp_ids = {x for x in (_norm_edizione(exp.get("code") or ""),
+                                           _norm_edizione(exp.get("name_en") or "")) if x}
+                    if exp_ids:
+                        if escluse and exp_ids & set(escluse):
+                            continue
+                        if incluse and not (exp_ids & set(incluse)):
+                            continue
+
                     prezzo_cents = p.get("price_cents")
                     valuta = p.get("price_currency")
                     if prezzo_cents is None or valuta is None:
@@ -323,6 +406,7 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto):
                         continue
 
                     numero_offerte_valide += 1
+                    prezzi_validi.append(prezzo)
                     if miglior is None or prezzo < miglior[0]:
                         prezzo_nativo = p.get("price", {})
                         miglior = (prezzo, {
@@ -348,7 +432,22 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto):
             )
         return None, "nessuna offerta trovata con i filtri richiesti (mercato vuoto)"
 
+    miglior[1]["prezzi_offerte"] = sorted(prezzi_validi)
     return (miglior[0], miglior[1], numero_offerte_valide), None
+
+
+def analizza_occasione(prezzi_offerte, soglia_pct, n_riferimento=20, minimo_offerte=5):
+    """Confronta l'offerta più economica con la media delle (fino a) 20 offerte
+    più economiche (minimo incluso). Ritorna (media, sconto_pct, e_occasione)
+    oppure None se le offerte sono troppo poche per un confronto sensato."""
+    if len(prezzi_offerte) < minimo_offerte:
+        return None
+    migliori = sorted(prezzi_offerte)[:n_riferimento]
+    media = sum(migliori) / len(migliori)
+    if media <= 0:
+        return None
+    sconto = 100 * (media - migliori[0]) / media
+    return media, sconto, sconto >= soglia_pct
 
 
 # ---------------------------------------------------------------------------
@@ -383,37 +482,43 @@ def calcola_tendenza(ultimi_prezzi):
 # Telegram
 # ---------------------------------------------------------------------------
 
-def _slugify(testo):
-    testo = testo.lower()
-    testo = testo.replace("'", "").replace("’", "")
-    testo = re.sub(r"[^a-z0-9]+", "-", testo)
-    return testo.strip("-")
-
-
-def link_pagina_carta(nome_carta, nome_espansione):
-    """Costruisce il link diretto alla pagina della carta su CardTrader
-    (es. cardtrader.com/en/cards/nome-carta-espansione). È una ricostruzione
-    euristica basata sullo schema URL osservato sul sito, non garantita al
-    100% per nomi con caratteri particolari."""
-    if not nome_espansione:
-        return None
-    slug = f"{_slugify(nome_carta)}-{_slugify(nome_espansione)}"
-    return f"https://www.cardtrader.com/en/cards/{slug}"
-
-
-def invia_telegram(bot_token, chat_id, testo):
+def invia_telegram(bot_token, chat_id, testo, tastiera=None):
+    """tastiera: lista di righe di bottoni [[(testo, callback_data), ...], ...]"""
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    r = requests.post(url, data={"chat_id": chat_id, "text": testo, "parse_mode": "HTML"}, timeout=15)
+    dati = {"chat_id": chat_id, "text": testo, "parse_mode": "HTML"}
+    if tastiera:
+        dati["reply_markup"] = json.dumps(_inline_keyboard(tastiera))
+    r = requests.post(url, data=dati, timeout=15)
     if not r.ok:
         print(f"Errore invio Telegram: {r.text}", file=sys.stderr)
 
 
-def invia_telegram_foto(bot_token, chat_id, percorso_immagine, didascalia=""):
+def _inline_keyboard(tastiera):
+    return {"inline_keyboard": [
+        [{"text": t, "callback_data": d} for t, d in riga] for riga in tastiera
+    ]}
+
+
+def rispondi_callback(bot_token, callback_query_id):
+    """Toglie il 'caricamento' dal bottone cliccato (innocuo se già fatto)."""
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery",
+            data={"callback_query_id": callback_query_id}, timeout=10,
+        )
+    except requests.RequestException:
+        pass
+
+
+def invia_telegram_foto(bot_token, chat_id, percorso_immagine, didascalia="", tastiera=None):
     url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+    dati = {"chat_id": chat_id, "caption": didascalia, "parse_mode": "HTML"}
+    if tastiera:
+        dati["reply_markup"] = json.dumps(_inline_keyboard(tastiera))
     with open(percorso_immagine, "rb") as f:
         r = requests.post(
             url,
-            data={"chat_id": chat_id, "caption": didascalia, "parse_mode": "HTML"},
+            data=dati,
             files={"photo": f},
             timeout=30,
         )
