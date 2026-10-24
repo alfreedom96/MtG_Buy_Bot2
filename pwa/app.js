@@ -13,6 +13,7 @@ const S = {
   filtro: "tutte",
   range: {},
   polling: null,
+  impostazioni: { telegram: true },
   caricato: false,
 };
 
@@ -86,7 +87,11 @@ async function api(path, opt = {}) {
   return r.json();
 }
 
-async function caricaCarte() { S.carte = (await api("/api/carte")).carte || []; }
+async function caricaCarte() {
+  const r = await api("/api/carte");
+  S.carte = r.carte || [];
+  S.impostazioni = r.impostazioni || { telegram: true };
+}
 async function caricaDati() { S.dati = await api("/api/dati"); }
 
 async function salvaCarte(nuove) {
@@ -242,15 +247,22 @@ function aggiornaLista() {
   if (S.filtro === "bassi") lista = tutti.filter((g) => g.varianti.some((c) => stato(c).cls === "gold"));
 
   const main = $("#lista");
+  const banner = bannerNotifiche();
+  main.onclick = (e) => {
+    if (e.target.closest("#b-attiva")) return attivaDaBanner();
+    if (e.target.closest("#b-dopo")) { scriviLocale("banner-notifiche", "no"); return aggiornaLista(); }
+    const r = e.target.closest(".card-row");
+    if (r) location.hash = "c/" + encodeURIComponent(r.dataset.k);
+  };
   if (!S.carte.length) {
-    main.innerHTML = `<div class="empty"><strong>Nessuna carta seguita</strong>Cerca una carta qui sopra per aggiungerla, oppure importa la lista dal foglio Google dal menu.</div>`;
+    main.innerHTML = banner + `<div class="empty"><strong>Nessuna carta seguita</strong>Cerca una carta qui sopra per aggiungerla, oppure importa la lista dal foglio Google dal menu.</div>`;
     return;
   }
   if (!lista.length) {
-    main.innerHTML = `<div class="empty"><strong>Niente da segnalare</strong>Nessuna carta in questa categoria al momento.</div>`;
+    main.innerHTML = banner + `<div class="empty"><strong>Niente da segnalare</strong>Nessuna carta in questa categoria al momento.</div>`;
     return;
   }
-  main.innerHTML = lista.map((g) => `
+  main.innerHTML = banner + lista.map((g) => `
     <button class="card-row" data-k="${esc(g.k)}">
       <img class="thumb" loading="lazy" alt="" src="${esc(immagine(g.nome, "art_crop"))}">
       <div>
@@ -266,10 +278,6 @@ function aggiornaLista() {
         }).join("")}
       </div>
     </button>`).join("");
-  main.onclick = (e) => {
-    const r = e.target.closest(".card-row");
-    if (r) location.hash = "c/" + encodeURIComponent(r.dataset.k);
-  };
 }
 
 function sparkline(serie) {
@@ -493,12 +501,14 @@ function apriMenu() {
     <h2>Menu</h2>
     <div class="menu-list" style="margin-top:14px">
       <button class="btn" id="m-check">Aggiorna prezzi ora</button>
+      <button class="btn" id="m-notifiche">Notifiche</button>
       <button class="btn" id="m-import">Importa dal foglio Google</button>
       <button class="btn danger" id="m-exit">Esci</button>
     </div>`);
   $("#m-check", p).onclick = () => { chiudiPannello(); avviaControllo(false); };
   $("#m-import", p).onclick = apriImporta;
   $("#m-exit", p).onclick = () => esci("");
+  $("#m-notifiche", p).onclick = apriNotifiche;
 }
 
 function apriImporta() {
@@ -681,6 +691,170 @@ async function rimuovi(id) {
   }
 }
 
+/* ------------------------------------------------------------------ notifiche */
+
+const pushSupportato = () => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+
+function daB64url(s) {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  return Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+}
+function aB64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function iscrizioneAttuale() {
+  if (!pushSupportato()) return null;
+  const reg = await navigator.serviceWorker.ready;
+  return reg.pushManager.getSubscription();
+}
+
+function nomeTelefono() {
+  const ua = navigator.userAgent;
+  const m = ua.match(/Android [\d.]+; ([^;)]+)/);
+  return m ? m[1].trim() : (navigator.platform || "dispositivo");
+}
+
+async function registraIscrizione(sub) {
+  await api("/api/push/iscrivi", { method: "POST", body: JSON.stringify({ iscrizione: sub.toJSON(), nome: nomeTelefono() }) });
+  scriviLocale("push-endpoint", sub.endpoint);
+  scriviLocale("push-sync", String(Date.now()));
+}
+
+async function attivaNotifiche() {
+  if (!pushSupportato()) throw new Error("questo browser non supporta le notifiche");
+  const permesso = await Notification.requestPermission();
+  if (permesso !== "granted") throw new Error(permesso === "denied" ? "le notifiche sono bloccate nelle impostazioni del telefono" : "permesso non concesso");
+  const { chiave } = await api("/api/push/chiave");
+  const reg = await navigator.serviceWorker.ready;
+  let sub = await reg.pushManager.getSubscription();
+  // se la chiave del Worker è cambiata, l'iscrizione vecchia non funziona più
+  if (sub && sub.options && sub.options.applicationServerKey && aB64url(sub.options.applicationServerKey) !== chiave) {
+    await sub.unsubscribe();
+    sub = null;
+  }
+  if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: daB64url(chiave) });
+  await registraIscrizione(sub);
+}
+
+async function disattivaNotifiche() {
+  const sub = await iscrizioneAttuale();
+  if (!sub) return;
+  await api("/api/push/rimuovi", { method: "POST", body: JSON.stringify({ endpoint: sub.endpoint }) });
+  await sub.unsubscribe();
+  scriviLocale("push-endpoint", "");
+}
+
+/* All'apertura: se il telefono ha cambiato iscrizione (succede di rado),
+   la comunico al Worker; altrimenti la riconfermo una volta al giorno. */
+async function sincronizzaIscrizione() {
+  try {
+    if (!pushSupportato() || Notification.permission !== "granted") return;
+    const sub = await iscrizioneAttuale();
+    if (!sub) return;
+    const cambiata = sub.endpoint !== leggiLocale("push-endpoint");
+    const vecchia = Date.now() - Number(leggiLocale("push-sync") || 0) > 86400000;
+    if (cambiata || vecchia) await registraIscrizione(sub);
+  } catch (e) { /* riprovo alla prossima apertura */ }
+}
+
+function bannerNotifiche() {
+  if (!pushSupportato() || Notification.permission !== "default" || leggiLocale("banner-notifiche") === "no") return "";
+  return `<div class="banner">
+    <p>Attiva le notifiche per sapere subito quando una carta è in occasione, anche ad app chiusa.</p>
+    <div class="row-btns"><button class="btn primary" id="b-attiva">Attiva notifiche</button><button class="btn" id="b-dopo">Non ora</button></div>
+  </div>`;
+}
+
+async function attivaDaBanner() {
+  try {
+    await attivaNotifiche();
+    toast("Notifiche attive su questo telefono.");
+  } catch (e) {
+    toast("Notifiche non attivate: " + e.message);
+  }
+  aggiornaLista();
+}
+
+async function apriNotifiche() {
+  const p = apriPannello(`
+    <h2>Notifiche</h2>
+    <p class="sub">Un avviso quando una carta è in occasione, tra i prezzi più bassi mai visti, o quando il controllo di una carta continua a fallire.</p>
+    <div class="field"><span class="lab">Su questo telefono</span>
+      <p id="n-stato" class="settings-line">Controllo…</p>
+      <div class="row-btns">
+        <button class="btn primary" id="n-toggle" hidden></button>
+        <button class="btn" id="n-prova">Invia una prova</button>
+      </div>
+    </div>
+    <div class="field"><span class="lab">Avvisi anche su Telegram</span>
+      <div class="seg" id="n-tg">
+        <button type="button" data-v="si" aria-pressed="${S.impostazioni.telegram !== false}">Sì</button>
+        <button type="button" data-v="no" aria-pressed="${S.impostazioni.telegram === false}">No</button>
+      </div>
+      <div class="help">Con "No" gli avvisi arrivano solo qui. I comandi del bot Telegram e il riepilogo settimanale restano attivi comunque.</div>
+    </div>
+    <div class="sheet-actions"><button class="btn" id="n-chiudi">Chiudi</button></div>`);
+  $("#n-chiudi", p).onclick = chiudiPannello;
+
+  const aggiornaStato = async () => {
+    const stato = $("#n-stato", p), bottone = $("#n-toggle", p);
+    if (!pushSupportato()) {
+      stato.textContent = "Questo browser non supporta le notifiche. Apri l'app installata da Chrome.";
+      bottone.hidden = true;
+      return;
+    }
+    if (Notification.permission === "denied") {
+      stato.textContent = "Bloccate. Per sbloccarle: Impostazioni di Android → App → Price Watch (o Chrome) → Notifiche → consenti, poi torna qui.";
+      bottone.hidden = true;
+      return;
+    }
+    const sub = await iscrizioneAttuale();
+    const attive = Notification.permission === "granted" && !!sub;
+    stato.textContent = attive ? "Attive." : "Non attive.";
+    bottone.textContent = attive ? "Disattiva" : "Attiva";
+    bottone.className = attive ? "btn danger" : "btn primary";
+    bottone.hidden = false;
+    bottone.onclick = async () => {
+      bottone.disabled = true;
+      try {
+        if (attive) { await disattivaNotifiche(); toast("Notifiche disattivate su questo telefono."); }
+        else { await attivaNotifiche(); toast("Notifiche attive su questo telefono."); }
+      } catch (e) {
+        toast("Operazione non riuscita: " + e.message);
+      }
+      bottone.disabled = false;
+      aggiornaStato();
+    };
+  };
+  aggiornaStato();
+
+  $("#n-prova", p).onclick = async () => {
+    try {
+      const r = await api("/api/push/prova", { method: "POST" });
+      if (!r.telefoni) toast("Nessun telefono registrato: premi prima Attiva.");
+      else if (r.inviate) toast(`Notifica di prova inviata a ${r.inviate} ${r.inviate === 1 ? "telefono" : "telefoni"}.`);
+      else toast("Invio non riuscito: " + (r.errori || []).join(", "));
+    } catch (e) {
+      toast("Invio non riuscito: " + e.message);
+    }
+  };
+
+  $("#n-tg", p).onclick = async (e) => {
+    const b = e.target.closest("button[data-v]");
+    if (!b) return;
+    const telegram = b.dataset.v === "si";
+    try {
+      S.impostazioni = await api("/api/impostazioni", { method: "PUT", body: JSON.stringify({ telegram }) });
+      $("#n-tg", p).querySelectorAll("button").forEach((x) => x.setAttribute("aria-pressed", x === b));
+      toast(telegram ? "Gli avvisi arriveranno anche su Telegram." : "Gli avvisi arriveranno solo nell'app.");
+    } catch (err) {
+      toast("Impostazione non salvata: " + err.message);
+    }
+  };
+}
+
 /* ------------------------------------------------------------------ avvio */
 
 function render() {
@@ -704,6 +878,7 @@ async function avvio() {
   S.caricato = true;
   render();
   sistemaNomi();
+  sincronizzaIscrizione();
 }
 
 /* I nomi importati dal foglio sono spesso in minuscolo: li sostituisco una
@@ -739,6 +914,10 @@ document.addEventListener("visibilitychange", async () => {
 
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(() => {});
+  // il service worker chiede di aprire una scheda carta (tocco su una notifica)
+  navigator.serviceWorker.addEventListener("message", (e) => {
+    if (e.data && typeof e.data.vai === "string") location.hash = e.data.vai.replace(/^\/?#?/, "");
+  });
 }
 
 if (S.pw) avvio(); else renderLogin();

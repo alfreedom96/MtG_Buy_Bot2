@@ -12,6 +12,12 @@
  *       GET  /api/dati       prezzi e storico compatto (app_data.json dal repo dati privato)
  *       POST /api/controlla  avvia subito il controllo prezzi su GitHub Actions
  *       POST /api/importa    importa le carte da un foglio Google pubblicato come CSV
+ *       GET/PUT /api/impostazioni   preferenze (es. avvisi anche su Telegram)
+ *       GET  /api/push/chiave       chiave pubblica per le notifiche push
+ *       POST /api/push/iscrivi      registra un telefono per le notifiche
+ *       POST /api/push/rimuovi      smette di inviare notifiche a un telefono
+ *       POST /api/push/prova        manda una notifica di prova
+ *       POST /api/notifica          manda una notifica a tutti i telefoni (usato da GitHub Actions)
  *  3. Riceve il webhook di Telegram (POST su qualunque altro indirizzo) e
  *     avvia il workflow dei comandi del bot, come prima.
  *
@@ -86,7 +92,54 @@ async function gestisciApi(request, env, url) {
 
   const p = url.pathname, m = request.method;
 
-  if (p === "/api/carte" && m === "GET") return json({ carte: await leggiCarte(env) });
+  if (p === "/api/carte" && m === "GET") {
+    return json({ carte: await leggiCarte(env), impostazioni: await leggiImpostazioni(env) });
+  }
+
+  if (p === "/api/impostazioni" && m === "GET") return json(await leggiImpostazioni(env));
+  if (p === "/api/impostazioni" && m === "PUT") {
+    const body = await request.json().catch(() => ({}));
+    const imp = { ...(await leggiImpostazioni(env)) };
+    if (typeof body.telegram === "boolean") imp.telegram = body.telegram;
+    await kv(env).put("impostazioni", JSON.stringify(imp));
+    return json(imp);
+  }
+
+  if (p === "/api/push/chiave" && m === "GET") return json({ chiave: (await chiaviVapid(env)).pubblica });
+
+  if (p === "/api/push/iscrivi" && m === "POST") {
+    const body = await request.json().catch(() => ({}));
+    const i = body.iscrizione || {};
+    if (!i.endpoint || !i.keys || !i.keys.p256dh || !i.keys.auth || !/^https:\/\//.test(i.endpoint)) {
+      return json({ errore: "iscrizione non valida" }, 400);
+    }
+    const lista = (await leggiIscrizioni(env)).filter((x) => x.endpoint !== i.endpoint);
+    lista.push({ endpoint: i.endpoint, keys: { p256dh: i.keys.p256dh, auth: i.keys.auth }, nome: testo(body.nome, 60), creata: new Date().toISOString() });
+    await kv(env).put("iscrizioni", JSON.stringify(lista.slice(-10)));
+    return json({ ok: true, telefoni: lista.length });
+  }
+
+  if (p === "/api/push/rimuovi" && m === "POST") {
+    const body = await request.json().catch(() => ({}));
+    const lista = (await leggiIscrizioni(env)).filter((x) => x.endpoint !== body.endpoint);
+    await kv(env).put("iscrizioni", JSON.stringify(lista));
+    return json({ ok: true, telefoni: lista.length });
+  }
+
+  if (p === "/api/push/prova" && m === "POST") {
+    return json(await notificaTutti(env, {
+      titolo: "Notifiche attive",
+      testo: "Da ora gli avvisi su occasioni e prezzi bassi arrivano qui.",
+      url: "/",
+      tag: "prova",
+    }, request.url));
+  }
+
+  if (p === "/api/notifica" && m === "POST") {
+    const body = await request.json().catch(() => null);
+    if (!body || !body.titolo) return json({ errore: "manca il titolo" }, 400);
+    return json(await notificaTutti(env, body, request.url));
+  }
 
   if (p === "/api/carte" && m === "PUT") {
     const body = await request.json().catch(() => null);
@@ -205,9 +258,17 @@ async function importaFoglio(env, link) {
   if (u.protocol !== "https:") return json({ errore: "serve un link https" }, 400);
   const r = await fetch(u.toString(), { redirect: "follow" });
   if (!r.ok) return json({ errore: `il foglio ha risposto ${r.status}: è pubblicato sul web come CSV?` }, 502);
-  const righe = leggiCsv(await r.text());
+  const testoCsv = await r.text();
+  const tipo = r.headers.get("Content-Type") || "";
+  if (tipo.includes("text/html") || /^\s*<(!doctype|html)/i.test(testoCsv)) {
+    return json({ errore: "il link apre una pagina web, non un file CSV. In Pubblica sul web scegli il formato \"Valori separati da virgola (.csv)\": il link deve finire con output=csv" }, 400);
+  }
+  const righe = leggiCsv(testoCsv);
   if (righe.length < 2) return json({ errore: "il foglio sembra vuoto" }, 400);
   const intest = righe[0].map((h) => h.trim().toLowerCase());
+  if (!["nome_carta", "nome", "carta"].some((n) => intest.includes(n))) {
+    return json({ errore: `non trovo la colonna nome_carta nella prima riga (ho trovato: ${intest.slice(0, 7).join(", ") || "niente"})` }, 400);
+  }
   const col = (riga, ...nomi) => {
     for (const n of nomi) { const i = intest.indexOf(n); if (i >= 0 && riga[i] != null) return riga[i].trim(); }
     return "";
@@ -260,6 +321,139 @@ function leggiCsv(t) {
   }
   if (campo || riga.length) { riga.push(campo); righe.push(riga); }
   return righe.filter((r) => r.some((c) => c.trim()));
+}
+
+/* ------------------------------------------------------------------ impostazioni */
+
+async function leggiImpostazioni(env) {
+  const base = { telegram: true };
+  const t = await kv(env).get("impostazioni");
+  if (!t) return base;
+  try { return { ...base, ...JSON.parse(t) }; } catch (e) { return base; }
+}
+
+/* ------------------------------------------------------------------ notifiche push (Web Push) */
+/* Standard usati: RFC 8030 (Web Push), RFC 8291 (cifratura dei messaggi,
+   "aes128gcm"), RFC 8292 (VAPID, l'identificazione di chi invia). */
+
+const enc = new TextEncoder();
+
+function b64url(bytes) {
+  let s = "";
+  for (const b of new Uint8Array(bytes)) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function daB64url(s) {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function unisci(...parti) {
+  const tot = parti.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(tot);
+  let i = 0;
+  for (const p of parti) { out.set(p, i); i += p.length; }
+  return out;
+}
+
+async function leggiIscrizioni(env) {
+  const t = await kv(env).get("iscrizioni");
+  if (!t) return [];
+  try { return JSON.parse(t); } catch (e) { return []; }
+}
+
+/* Le chiavi VAPID vengono create alla prima richiesta e salvate nel KV:
+   non serve configurare niente. Se si cancellano, i telefoni vanno
+   riattivati dall'app. */
+async function chiaviVapid(env) {
+  const salvate = await kv(env).get("vapid");
+  if (salvate) {
+    try { return JSON.parse(salvate); } catch (e) { /* rigenero */ }
+  }
+  const coppia = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const chiavi = {
+    pubblica: b64url(await crypto.subtle.exportKey("raw", coppia.publicKey)),
+    privata: await crypto.subtle.exportKey("jwk", coppia.privateKey),
+  };
+  await kv(env).put("vapid", JSON.stringify(chiavi));
+  return chiavi;
+}
+
+async function intestazioneVapid(chiavi, endpoint, contatto) {
+  const aud = new URL(endpoint).origin;
+  const head = b64url(enc.encode(JSON.stringify({ typ: "JWT", alg: "ES256" })));
+  const body = b64url(enc.encode(JSON.stringify({ aud, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: contatto })));
+  const chiave = await crypto.subtle.importKey("jwk", chiavi.privata, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+  const firma = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, chiave, enc.encode(`${head}.${body}`));
+  return `vapid t=${head}.${body}.${b64url(firma)}, k=${chiavi.pubblica}`;
+}
+
+async function hkdf(salt, ikm, info, lunghezza) {
+  const k = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]);
+  return new Uint8Array(await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt, info }, k, lunghezza * 8));
+}
+
+/* Cifra il messaggio per un telefono (RFC 8291) */
+async function cifra(iscrizione, testoChiaro) {
+  const uaPub = daB64url(iscrizione.keys.p256dh);
+  const auth = daB64url(iscrizione.keys.auth);
+  const effimera = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  const asPub = new Uint8Array(await crypto.subtle.exportKey("raw", effimera.publicKey));
+  const uaKey = await crypto.subtle.importKey("raw", uaPub, { name: "ECDH", namedCurve: "P-256" }, false, []);
+  const segreto = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: uaKey }, effimera.privateKey, 256));
+  const ikm = await hkdf(auth, segreto, unisci(enc.encode("WebPush: info\0"), uaPub, asPub), 32);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const cek = await hkdf(salt, ikm, enc.encode("Content-Encoding: aes128gcm\0"), 16);
+  const nonce = await hkdf(salt, ikm, enc.encode("Content-Encoding: nonce\0"), 12);
+  const chiaveAes = await crypto.subtle.importKey("raw", cek, "AES-GCM", false, ["encrypt"]);
+  const chiaro = unisci(enc.encode(testoChiaro), new Uint8Array([2])); // 2 = ultimo blocco
+  const cifrato = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, chiaveAes, chiaro));
+  const rs = new Uint8Array([0, 0, 16, 0]); // dimensione blocco 4096
+  return unisci(salt, rs, new Uint8Array([asPub.length]), asPub, cifrato);
+}
+
+async function inviaPush(env, chiavi, iscrizione, messaggio, contatto) {
+  const corpo = await cifra(iscrizione, JSON.stringify(messaggio));
+  return fetch(iscrizione.endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: await intestazioneVapid(chiavi, iscrizione.endpoint, contatto),
+      "Content-Encoding": "aes128gcm",
+      "Content-Type": "application/octet-stream",
+      TTL: "86400",
+      Urgency: "high",
+    },
+    body: corpo,
+  });
+}
+
+async function notificaTutti(env, dati, urlRichiesta) {
+  const messaggio = {
+    titolo: testo(dati.titolo, 120),
+    testo: testo(dati.testo, 600),
+    url: testo(dati.url, 300) || "/",
+    tag: testo(dati.tag, 120),
+  };
+  const iscrizioni = await leggiIscrizioni(env);
+  if (!iscrizioni.length) return { inviate: 0, rimosse: 0, errori: [], telefoni: 0 };
+  const chiavi = await chiaviVapid(env);
+  const contatto = new URL(urlRichiesta).origin; // "sub" del VAPID: un indirizzo di contatto
+  const esiti = await Promise.all(iscrizioni.map((i) =>
+    inviaPush(env, chiavi, i, messaggio, contatto).then((r) => r.status, (e) => "errore: " + e.message)));
+  // 404/410: il telefono ha disattivato le notifiche o reinstallato l'app
+  const valide = iscrizioni.filter((_, n) => esiti[n] !== 404 && esiti[n] !== 410);
+  if (valide.length !== iscrizioni.length) await kv(env).put("iscrizioni", JSON.stringify(valide));
+  return {
+    inviate: esiti.filter((x) => typeof x === "number" && x >= 200 && x < 300).length,
+    rimosse: iscrizioni.length - valide.length,
+    errori: esiti.filter((x) => !(typeof x === "number" && x >= 200 && x < 300) && x !== 404 && x !== 410).map(String),
+    telefoni: valide.length,
+  };
 }
 
 /* ------------------------------------------------------------------ Telegram */

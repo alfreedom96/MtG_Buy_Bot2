@@ -38,7 +38,8 @@ from common import (
     migra_chiavi_minuscole,
     scrivi_dati_app,
     env,
-    invia_telegram,
+    Avvisi,
+    url_carta_app,
     link_pagina_carta,
     analizza_occasione,
     miglior_prezzo,
@@ -46,7 +47,12 @@ from common import (
 )
 
 
-def gestisci_fallimento(record, nome, motivo, tg_token, tg_chat_id):
+def euro(x):
+    """12.5 -> '12,50 €'"""
+    return f"{x:.2f} €".replace(".", ",")
+
+
+def gestisci_fallimento(record, nome, motivo, avvisi):
     """Aggiorna il contatore di fallimenti consecutivi per una carta e, se
     supera la soglia, manda un avviso tecnico una sola volta (finché non
     torna a funzionare)."""
@@ -56,26 +62,30 @@ def gestisci_fallimento(record, nome, motivo, tg_token, tg_chat_id):
         record["fallimenti_consecutivi"] >= SOGLIA_FALLIMENTI_CONSECUTIVI
         and not record.get("allarme_fallimento_inviato")
     ):
-        invia_telegram(
-            tg_token, tg_chat_id,
+        avvisi.invia(
             f"⚠️ <b>{nome}</b>\n"
             f"Nessun risultato valido da {record['fallimenti_consecutivi']} controlli consecutivi.\n"
             f"Ultimo motivo: {motivo}\n"
-            f"Controlla il nome della carta nel foglio o i filtri impostati."
+            f"Controlla il nome della carta o i filtri impostati.",
+            f"⚠️ {nome}: nessun risultato",
+            f"{record['fallimenti_consecutivi']} controlli falliti di fila. Ultimo motivo: {motivo}",
+            url_carta_app(nome), f"errore-{nome.lower()}",
         )
         record["allarme_fallimento_inviato"] = True
 
 
 def main():
     ct_token = env("CARDTRADER_TOKEN", required=True)
-    tg_token = env("TELEGRAM_BOT_TOKEN", required=True)
-    tg_chat_id = env("TELEGRAM_CHAT_ID", required=True)
+    tg_token = env("TELEGRAM_BOT_TOKEN", "")
+    tg_chat_id = env("TELEGRAM_CHAT_ID", "")
     percentile_default = float(env("DEFAULT_PERCENTILE_SOGLIA", "15"))
     occasione_default = float(env("DEFAULT_SOGLIA_OCCASIONE", "10"))
 
     ct_client = CardTraderClient(ct_token)
     storico = migra_chiavi_minuscole(carica_storico())
-    righe, fonte = leggi_lista_carte_configurata()
+    righe, fonte, impostazioni = leggi_lista_carte_configurata()
+    avvisi = Avvisi(tg_token, tg_chat_id, impostazioni)
+    print(f"Avvisi: app {'sì' if fonte == 'app' else 'no'}, Telegram {'sì' if avvisi.telegram else 'no'}")
 
     print(f"Carte da controllare: {len(righe)} (lista letta da: {fonte})")
 
@@ -96,7 +106,7 @@ def main():
 
             if errore:
                 print(f"   {errore}")
-                gestisci_fallimento(record, nome, errore, tg_token, tg_chat_id)
+                gestisci_fallimento(record, nome, errore, avvisi)
                 storico[chiave] = record
                 continue
 
@@ -150,7 +160,13 @@ def main():
                     )
                     if link:
                         msg += f"\n🔗 {link}"
-                    invia_telegram(tg_token, tg_chat_id, msg)
+                    avvisi.invia(
+                        msg,
+                        f"💰 {nome} a {euro(prezzo)}",
+                        f"Tra i prezzi più bassi mai visti: percentile {percentile:.0f}, media storica "
+                        f"{euro(media)}. {dettagli['condizione']}, {dettagli['espansione']}.",
+                        url_carta_app(nome), f"basso-{chiave}",
+                    )
                     record["ultima_notifica_prezzo"] = prezzo
                     print("   -> notifica inviata")
 
@@ -182,7 +198,14 @@ def main():
                         )
                         if link:
                             msg += f"\n🔗 {link}"
-                        invia_telegram(tg_token, tg_chat_id, msg)
+                        avvisi.invia(
+                            msg,
+                            f"🔥 Occasione: {nome} a {euro(prezzo)}",
+                            f"{sconto:.0f}% sotto la media delle {min(N_OFFERTE_RIFERIMENTO, len(prezzi_offerte))} "
+                            f"offerte più economiche ({euro(media20)}). {dettagli['condizione']}, "
+                            f"{dettagli['espansione']}, venditore {dettagli.get('venditore')}.",
+                            url_carta_app(nome), f"occasione-{chiave}",
+                        )
                         record["ultima_occasione"] = {"product_id": dettagli.get("product_id"), "prezzo": prezzo}
                         print("   -> notifica OCCASIONE inviata")
 
@@ -213,7 +236,7 @@ def main():
             # Non blocchiamo mai il controllo delle altre carte per un
             # problema isolato su una singola riga del foglio.
             print(f"   [errore] problema imprevisto con '{nome}', la salto: {e}")
-            gestisci_fallimento(record, nome, str(e), tg_token, tg_chat_id)
+            gestisci_fallimento(record, nome, str(e), avvisi)
             storico[chiave] = record
             continue
 

@@ -2,8 +2,8 @@
    - guscio dell'app: dalla cache, aggiornato in background
    - /api/dati e /api/carte: prima dalla rete, dalla cache se offline
    - immagini Scryfall e font: dalla cache dopo il primo download */
-const VERSIONE = "pw-v1";
-const GUSCIO = ["/", "/app.js", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png"];
+const VERSIONE = "pw-v2";
+const GUSCIO = ["/", "/app.js", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png", "/badge.png"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(VERSIONE).then((c) => c.addAll(GUSCIO)).then(() => self.skipWaiting()));
@@ -59,4 +59,35 @@ self.addEventListener("fetch", (e) => {
       })
     );
   }
+});
+
+/* ---------------------------------------------------------------- notifiche */
+
+self.addEventListener("push", (e) => {
+  let d = {};
+  try { d = e.data ? e.data.json() : {}; } catch (err) { d = { testo: e.data ? e.data.text() : "" }; }
+  e.waitUntil(self.registration.showNotification(d.titolo || "Price Watch", {
+    body: d.testo || "",
+    icon: "/icon-192.png",
+    badge: "/badge.png",
+    tag: d.tag || undefined,
+    renotify: !!d.tag,
+    data: { url: d.url || "/" },
+  }));
+});
+
+self.addEventListener("notificationclick", (e) => {
+  e.notification.close();
+  const url = (e.notification.data && e.notification.data.url) || "/";
+  e.waitUntil((async () => {
+    const finestre = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    for (const c of finestre) {
+      if (new URL(c.url).origin === self.location.origin) {
+        await c.focus();
+        c.postMessage({ vai: url });
+        return;
+      }
+    }
+    await self.clients.openWindow(new URL(url, self.location.origin).href);
+  })());
 });

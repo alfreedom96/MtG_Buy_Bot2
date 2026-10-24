@@ -146,19 +146,70 @@ def leggi_lista_carte_worker(worker_url, password):
     url = worker_url.rstrip("/") + "/api/carte"
     r = requests.get(url, headers={"Authorization": f"Bearer {password}"}, timeout=30)
     r.raise_for_status()
-    carte = r.json().get("carte", [])
-    return [r for r in (_normalizza_riga(c) for c in carte) if r]
+    dati = r.json()
+    righe = [r for r in (_normalizza_riga(c) for c in dati.get("carte", [])) if r]
+    return righe, {**IMPOSTAZIONI_PREDEFINITE, **(dati.get("impostazioni") or {})}
+
+
+IMPOSTAZIONI_PREDEFINITE = {"telegram": True}
+
+
+def app_configurata():
+    return bool(os.environ.get("WORKER_URL", "").strip() and os.environ.get("APP_PASSWORD", "").strip())
 
 
 def leggi_lista_carte_configurata():
     """Usa l'app se configurata (WORKER_URL + APP_PASSWORD), altrimenti il
-    foglio Google (SHEET_CSV_URL). Ritorna (righe, descrizione_fonte)."""
-    worker_url = os.environ.get("WORKER_URL", "").strip()
-    password = os.environ.get("APP_PASSWORD", "").strip()
-    if worker_url and password:
-        return leggi_lista_carte_worker(worker_url, password), "app"
+    foglio Google (SHEET_CSV_URL). Ritorna (righe, descrizione_fonte, impostazioni)."""
+    if app_configurata():
+        righe, impostazioni = leggi_lista_carte_worker(os.environ["WORKER_URL"].strip(), os.environ["APP_PASSWORD"].strip())
+        return righe, "app", impostazioni
     sheet_url = env("SHEET_CSV_URL", required=True)
-    return leggi_lista_carte(sheet_url), "foglio Google"
+    return leggi_lista_carte(sheet_url), "foglio Google", dict(IMPOSTAZIONI_PREDEFINITE)
+
+
+def invia_notifica_app(titolo, testo, url="/", tag=None):
+    """Chiede al Worker di mandare una notifica push ai telefoni registrati
+    nell'app. Non solleva mai eccezioni: una notifica persa non deve
+    bloccare il controllo prezzi."""
+    if not app_configurata():
+        return
+    try:
+        r = requests.post(
+            os.environ["WORKER_URL"].strip().rstrip("/") + "/api/notifica",
+            headers={"Authorization": f"Bearer {os.environ['APP_PASSWORD'].strip()}"},
+            json={"titolo": titolo, "testo": testo, "url": url, "tag": tag},
+            timeout=30,
+        )
+        if r.ok:
+            esito = r.json()
+            print(f"   notifica app: inviata a {esito.get('inviate', 0)} telefoni"
+                  + (f", errori: {esito['errori']}" if esito.get("errori") else ""))
+        else:
+            print(f"   [avviso] notifica app non inviata: {r.status_code} {r.text[:200]}")
+    except requests.RequestException as e:
+        print(f"   [avviso] notifica app non inviata: {e}")
+
+
+def url_carta_app(nome):
+    """Indirizzo della scheda carta nell'app (si apre toccando la notifica)."""
+    from urllib.parse import quote
+    return "/#c/" + quote(pulisci_nome(nome).lower(), safe="")
+
+
+class Avvisi:
+    """Manda ogni avviso all'app (notifica push) e, se attivo
+    nelle impostazioni dell'app, anche su Telegram."""
+
+    def __init__(self, tg_token, tg_chat_id, impostazioni):
+        self.tg_token = tg_token
+        self.tg_chat_id = tg_chat_id
+        self.telegram = bool(impostazioni.get("telegram", True)) and bool(tg_token and tg_chat_id)
+
+    def invia(self, testo_telegram, titolo_app, testo_app, url="/", tag=None):
+        invia_notifica_app(titolo_app, testo_app, url, tag)
+        if self.telegram:
+            invia_telegram(self.tg_token, self.tg_chat_id, testo_telegram)
 
 
 def migra_chiavi_minuscole(storico):
