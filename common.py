@@ -23,6 +23,8 @@ SCRYFALL_HEADERS = {
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 HISTORY_FILE = os.path.join(DATA_DIR, "price_history.json")
 TELEGRAM_OFFSET_FILE = os.path.join(DATA_DIR, "telegram_offset.json")
+# Versione compatta dello storico letta dall'app (tramite il Cloudflare Worker)
+APP_DATA_FILE = os.path.join(DATA_DIR, "app_data.json")
 
 CONDIZIONI_ACCETTATE = {"Mint", "Near Mint", "Slightly Played"}
 MINIMO_PUNTI_PER_STATISTICA = 5
@@ -88,6 +90,32 @@ def _lista_edizioni(testo):
     return [_norm_edizione(t) for t in re.split(r"[;|]", testo) if t.strip()]
 
 
+def _normalizza_riga(row):
+    """Trasforma una riga (dal foglio o dall'app) nel formato usato dal
+    controllo prezzi. Ritorna None se manca il nome della carta."""
+    row = {str(k).strip().lower(): ("" if v is None else str(v)).strip() for k, v in row.items() if k}
+    nome = row.get("nome_carta") or row.get("nome") or row.get("carta")
+    if not nome:
+        return None
+    foil = (row.get("foil") or "si").lower()
+    if foil in ("sì", "yes", "true"):
+        foil = "si"
+    return {
+        "nome_carta": pulisci_nome(nome),
+        "lingua": (row.get("lingua") or "entrambe").lower(),
+        "foil": foil,
+        "percentile_soglia": row.get("percentile_soglia") or "",
+        "soglia_occasione": (row.get("soglia_occasione") or "").replace("%", "").replace(",", ".").strip(),
+        "edizioni_escluse": _lista_edizioni(row.get("edizioni_escluse")),
+        "edizioni_incluse": _lista_edizioni(row.get("edizioni_incluse")),
+    }
+
+
+def chiave_carta(riga):
+    """Chiave dello storico: 'nome in minuscolo|lingua|foil'."""
+    return f"{riga['nome_carta'].strip().lower()}|{riga['lingua']}|{riga['foil']}"
+
+
 def leggi_lista_carte(sheet_csv_url):
     """Scarica il Google Sheet pubblicato come CSV e restituisce le righe.
 
@@ -107,22 +135,47 @@ def leggi_lista_carte(sheet_csv_url):
     resp = requests.get(sheet_csv_url, timeout=30)
     resp.raise_for_status()
     reader = csv.DictReader(io.StringIO(resp.text))
-    righe = []
-    for raw in reader:
-        row = {k.strip().lower(): (v or "").strip() for k, v in raw.items() if k}
-        nome = row.get("nome_carta") or row.get("nome") or row.get("carta")
-        if not nome:
+    return [r for r in (_normalizza_riga(raw) for raw in reader) if r]
+
+
+def leggi_lista_carte_worker(worker_url, password):
+    """Legge la lista carte salvata dall'app (Cloudflare Worker + KV).
+    Solleva un'eccezione se il Worker non risponde: meglio un controllo
+    fallito (che healthchecks segnala) di uno fatto su una lista sbagliata."""
+    url = worker_url.rstrip("/") + "/api/carte"
+    r = requests.get(url, headers={"Authorization": f"Bearer {password}"}, timeout=30)
+    r.raise_for_status()
+    carte = r.json().get("carte", [])
+    return [r for r in (_normalizza_riga(c) for c in carte) if r]
+
+
+def leggi_lista_carte_configurata():
+    """Usa l'app se configurata (WORKER_URL + APP_PASSWORD), altrimenti il
+    foglio Google (SHEET_CSV_URL). Ritorna (righe, descrizione_fonte)."""
+    worker_url = os.environ.get("WORKER_URL", "").strip()
+    password = os.environ.get("APP_PASSWORD", "").strip()
+    if worker_url and password:
+        return leggi_lista_carte_worker(worker_url, password), "app"
+    sheet_url = env("SHEET_CSV_URL", required=True)
+    return leggi_lista_carte(sheet_url), "foglio Google"
+
+
+def migra_chiavi_minuscole(storico):
+    """Porta le chiavi dello storico al formato 'nome in minuscolo|...'
+    (l'app salva i nomi con le maiuscole, il foglio spesso in minuscolo:
+    così lo storico resta lo stesso qualunque sia la fonte)."""
+    for chiave in list(storico.keys()):
+        nuova = chiave.lower()
+        if nuova == chiave:
             continue
-        righe.append({
-            "nome_carta": nome,
-            "lingua": (row.get("lingua") or "entrambe").lower(),
-            "foil": (row.get("foil") or "si").lower(),
-            "percentile_soglia": row.get("percentile_soglia") or "",
-            "soglia_occasione": (row.get("soglia_occasione") or "").replace("%", "").replace(",", ".").strip(),
-            "edizioni_escluse": _lista_edizioni(row.get("edizioni_escluse")),
-            "edizioni_incluse": _lista_edizioni(row.get("edizioni_incluse")),
-        })
-    return righe
+        if nuova in storico:
+            # tengo la versione con più dati
+            if len(storico[chiave].get("rilevazioni", [])) > len(storico[nuova].get("rilevazioni", [])):
+                storico[nuova] = storico[chiave]
+            del storico[chiave]
+        else:
+            storico[nuova] = storico.pop(chiave)
+    return storico
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +529,85 @@ def calcola_tendenza(ultimi_prezzi):
     if all(d > 0 for d in differenze):
         return "🔺 in risalita"
     return "➡️ stabile/misto"
+
+
+# ---------------------------------------------------------------------------
+# Dati per l'app (versione compatta dello storico)
+# ---------------------------------------------------------------------------
+
+def _serie_compatta(rilevazioni, ore_dettaglio=48, ore_bucket=6):
+    """Ultime 48 ore a piena risoluzione, prima un punto (il prezzo minimo)
+    ogni 6 ore. Ritorna [[epoch_secondi, prezzo], ...]."""
+    from datetime import datetime, timezone
+    punti = []
+    for r in rilevazioni:
+        try:
+            t = int(datetime.strptime(r["data"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp())
+        except (KeyError, ValueError):
+            continue
+        punti.append((t, r["prezzo"]))
+    if not punti:
+        return []
+    limite = punti[-1][0] - ore_dettaglio * 3600
+    vecchi = {}
+    recenti = []
+    for t, p in punti:
+        if t >= limite:
+            recenti.append([t, p])
+        else:
+            bucket = t // (ore_bucket * 3600)
+            if bucket not in vecchi or p < vecchi[bucket][1]:
+                vecchi[bucket] = [t, p]
+    return [vecchi[k] for k in sorted(vecchi)] + recenti
+
+
+def scrivi_dati_app(storico, righe, percentile_default, occasione_default):
+    """Scrive data/app_data.json: per ogni carta della lista, statistiche,
+    ultima offerta migliore e una serie storica ridotta per i grafici."""
+    varianti = {}
+    for riga in righe:
+        chiave = chiave_carta(riga)
+        record = storico.get(chiave)
+        if not record:
+            continue
+        prezzi = [r["prezzo"] for r in record.get("rilevazioni", [])]
+        soglia_p = float(riga["percentile_soglia"]) if riga["percentile_soglia"] else percentile_default
+        soglia_o = float(riga["soglia_occasione"]) if riga["soglia_occasione"] else occasione_default
+        info = {
+            "n": len(prezzi),
+            "soglia_percentile": soglia_p,
+            "soglia_occasione": soglia_o,
+            "fallimenti": record.get("fallimenti_consecutivi", 0),
+            "ultimo_errore": record.get("ultimo_errore"),
+            "dettaglio": record.get("ultimo_dettaglio"),
+            "serie": _serie_compatta(record.get("rilevazioni", [])),
+        }
+        if prezzi:
+            ultimo = prezzi[-1]
+            passati = prezzi[:-1]
+            info.update({
+                "prezzo": ultimo,
+                "min": min(prezzi),
+                "max": max(prezzi),
+                "media": round(sum(prezzi) / len(prezzi), 4),
+                "tendenza": calcola_tendenza(prezzi[-3:]),
+                "percentile": (
+                    round(calcola_percentile(passati, ultimo), 1)
+                    if len(passati) >= MINIMO_PUNTI_PER_STATISTICA else None
+                ),
+                "ultimo_controllo": record["rilevazioni"][-1]["data"],
+            })
+            info["prezzo_basso"] = info["percentile"] is not None and info["percentile"] <= soglia_p
+            det = info["dettaglio"] or {}
+            info["occasione"] = det.get("sconto") is not None and det["sconto"] >= soglia_o
+        varianti[chiave] = info
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(APP_DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            {"generato": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "varianti": varianti},
+            f, ensure_ascii=False, separators=(",", ":"),
+        )
 
 
 # ---------------------------------------------------------------------------
