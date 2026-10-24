@@ -4,6 +4,7 @@
 
 const DEF_PERCENTILE = 15;
 const DEF_OCCASIONE = 10;
+const DEF_RIBASSO = 5;
 const SCRYFALL = "https://api.scryfall.com";
 
 const S = {
@@ -54,12 +55,14 @@ function dataOra(t) {
 }
 
 let toastTimer;
-function toast(msg, ms = 3500) {
+function toast(msg, ms) {
   const t = $("#toast");
   t.textContent = msg;
   t.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (t.hidden = true), ms);
+  // i messaggi lunghi (es. errori con istruzioni) restano più a lungo; un tocco li chiude
+  toastTimer = setTimeout(() => (t.hidden = true), ms || Math.max(3500, msg.length * 70));
+  t.onclick = () => (t.hidden = true);
 }
 
 const ICON = {
@@ -147,7 +150,9 @@ function stato(c) {
     const sc = Math.round(v.dettaglio.sconto);
     return { cls: "mythic", testo: `Occasione: ${sc}% sotto la media delle offerte più economiche` };
   }
-  if (v.prezzo_basso) return { cls: "gold", testo: "Tra i prezzi più bassi mai registrati" };
+  if (v.prezzo_basso) {
+    return { cls: "gold", testo: `Prezzo basso: ${Math.round(v.ribasso)}% sotto la mediana storica, tra i più bassi mai registrati` };
+  }
   return { cls: "", testo: "" };
 }
 
@@ -362,18 +367,34 @@ function renderDettaglio(k) {
   for (const c of varianti) disegnaGrafico(c);
 }
 
+function listaOfferte(d) {
+  const offerte = d.offerte || [];
+  if (!offerte.length) return "";
+  return `<details class="offerte"><summary>Le ${offerte.length} offerte usate per il confronto</summary>
+    <ol>${offerte.map((o, i) => `
+      <li${i === 0 ? ' class="prima"' : ""}>
+        <span class="num">${eur(o.prezzo)}</span>
+        <span>${esc([o.condizione, o.lingua ? o.lingua.toUpperCase() : "", o.foil ? "foil" : "non foil", o.espansione].filter(Boolean).join(", "))}
+          <small>${esc(o.venditore || "?")}${o.quantita ? `, ${o.quantita} disp.` : ""}</small></span>
+      </li>`).join("")}
+    </ol></details>`;
+}
+
 function sezioneVariante(c) {
   const v = info(c) || {};
   const st = stato(c);
   const d = v.dettaglio || {};
-  const sp = c.percentile_soglia || DEF_PERCENTILE, so = c.soglia_occasione || DEF_OCCASIONE;
+  const sp = c.percentile_soglia || DEF_PERCENTILE, so = c.soglia_occasione || DEF_OCCASIONE, sr = c.soglia_ribasso || DEF_RIBASSO;
   const edizioni = [
     c.edizioni_incluse ? `solo ${c.edizioni_incluse}` : "",
     c.edizioni_escluse ? `escluse ${c.edizioni_escluse}` : "",
   ].filter(Boolean).join("; ") || "tutte";
   let percentileTesto = "";
   if (v.percentile != null) {
-    percentileTesto = `<p class="settings-line">Percentile ${Math.round(v.percentile)}: il prezzo attuale è più basso del ${Math.round(100 - v.percentile)}% dei prezzi registrati finora (${v.n} rilevazioni).</p>`;
+    const r = v.ribasso != null ? Math.round(Math.abs(v.ribasso)) : null;
+    const rispettoMediana = v.mediana == null ? "" :
+      ` Mediana storica ${eur(v.mediana)}: il prezzo attuale è ${r === 0 ? "in linea" : `${r}% ${v.ribasso >= 0 ? "sotto" : "sopra"}`}.`;
+    percentileTesto = `<p class="settings-line">Percentile ${Math.round(v.percentile)}: il prezzo attuale è più basso del ${Math.round(100 - v.percentile)}% dei prezzi registrati finora (${v.n} rilevazioni).${rispettoMediana}</p>`;
   } else if (v.n) {
     percentileTesto = `<p class="settings-line">Raccolta dati in corso (${v.n} rilevazioni): il confronto con lo storico parte da 6.</p>`;
   }
@@ -402,9 +423,10 @@ function sezioneVariante(c) {
           <p class="muted">${esc([d.condizione, d.lingua ? d.lingua.toUpperCase() : "", d.foil ? "foil" : "non foil", d.espansione].filter(Boolean).join(", "))}</p>
           <p class="muted">Venditore ${esc(d.venditore || "?")}${d.quantita ? `, ${d.quantita} disponibili` : ""}</p>
           ${d.media20 != null ? `<p class="muted">Media delle ${d.n_riferimento || Math.min(10, d.offerte_valide || 10)} offerte più economiche: ${eur(d.media20)} (minimo ${Math.round(d.sconto)}% sotto)</p>` : ""}
+          ${listaOfferte(d)}
           ${d.link ? `<a class="btn primary block" href="${esc(d.link)}" target="_blank" rel="noopener">Apri su CardTrader</a>` : ""}
         </div>` : ""}
-      <p class="settings-line">Avvisi: prezzo sotto il ${esc(sp)}° percentile, occasione da ${esc(so)}% di sconto. Edizioni: ${esc(edizioni)}.</p>
+      <p class="settings-line">Avvisi: prezzo basso se sotto il ${esc(sp)}° percentile e almeno ${esc(sr)}% sotto la mediana storica; occasione da ${esc(so)}% di sconto. Edizioni: ${esc(edizioni)}.</p>
       <div class="row-btns">
         <button class="btn" data-edit="${esc(c.id)}">Modifica</button>
         <button class="btn danger" data-del="${esc(c.id)}">Rimuovi</button>
@@ -548,6 +570,7 @@ function apriModulo(c) {
     foil: c.foil || "si",
     percentile_soglia: c.percentile_soglia || "",
     soglia_occasione: c.soglia_occasione || "",
+    soglia_ribasso: c.soglia_ribasso || "",
     incl: new Set(), escl: new Set(),
     extraIncl: c.edizioni_incluse || "", extraEscl: c.edizioni_escluse || "",
   };
@@ -575,11 +598,16 @@ function apriModulo(c) {
         <div class="help">Codici, nomi o link delle pagine edizione di CardTrader, separati da punto e virgola.</div>
       </details>
     </div>
-    <div class="field two">
-      <div><label for="s-perc">Soglia prezzo basso</label><input class="input num" id="s-perc" inputmode="numeric" placeholder="${DEF_PERCENTILE}" value="${esc(f.percentile_soglia)}">
-        <div class="help">Percentile: 15 = avvisa se il prezzo è nel 15% più basso dello storico.</div></div>
-      <div><label for="s-occ">Soglia occasione (%)</label><input class="input num" id="s-occ" inputmode="numeric" placeholder="${DEF_OCCASIONE}" value="${esc(f.soglia_occasione)}">
-        <div class="help">Avvisa se il minimo è almeno questo % sotto la media delle 10 offerte più economiche.</div></div>
+    <div class="field"><span class="lab">Avviso prezzo basso</span>
+      <div class="two">
+        <div><label for="s-perc" class="help">Percentile massimo</label><input class="input num" id="s-perc" inputmode="numeric" placeholder="${DEF_PERCENTILE}" value="${esc(f.percentile_soglia)}"></div>
+        <div><label for="s-rib" class="help">Ribasso minimo (%)</label><input class="input num" id="s-rib" inputmode="numeric" placeholder="${DEF_RIBASSO}" value="${esc(f.soglia_ribasso)}"></div>
+      </div>
+      <div class="help">Scatta se il prezzo è tra i più bassi mai visti (15 = nel 15% più basso dello storico) <b>e</b> almeno questo % sotto la mediana, cioè il valore centrale dei prezzi registrati.</div>
+    </div>
+    <div class="field"><label for="s-occ">Avviso occasione: sconto minimo (%)</label>
+      <input class="input num" id="s-occ" inputmode="numeric" placeholder="${DEF_OCCASIONE}" value="${esc(f.soglia_occasione)}">
+      <div class="help">Scatta se l'offerta più economica è almeno questo % sotto la media delle 10 offerte più economiche.</div>
     </div>
     <div class="sheet-actions">
       <button class="btn" id="f-annulla">Annulla</button>
@@ -653,6 +681,7 @@ async function salvaModulo(f, p, nuovo) {
     foil: f.foil,
     percentile_soglia: numero($("#s-perc", p).value),
     soglia_occasione: numero($("#s-occ", p).value),
+    soglia_ribasso: numero($("#s-rib", p).value),
     edizioni_incluse: incl.join("; "),
     edizioni_escluse: escl.join("; "),
   };

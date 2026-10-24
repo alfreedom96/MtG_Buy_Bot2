@@ -31,6 +31,7 @@ MINIMO_PUNTI_PER_STATISTICA = 5
 MAX_PUNTI_STORICO = 5000  # circa 70 giorni con un controllo ogni 20 minuti
 SOGLIA_FALLIMENTI_CONSECUTIVI = 10  # dopo quanti fallimenti di fila avvisare
 N_OFFERTE_RIFERIMENTO = 10  # occasione: confronto con la media delle N offerte più economiche
+SOGLIA_RIBASSO_PREDEFINITA = 5.0  # "prezzo basso": almeno questo % sotto la mediana storica
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +107,7 @@ def _normalizza_riga(row):
         "lingua": (row.get("lingua") or "entrambe").lower(),
         "foil": foil,
         "percentile_soglia": row.get("percentile_soglia") or "",
+        "soglia_ribasso": (row.get("soglia_ribasso") or "").replace("%", "").replace(",", ".").strip(),
         "soglia_occasione": (row.get("soglia_occasione") or "").replace("%", "").replace(",", ".").strip(),
         "edizioni_escluse": _lista_edizioni(row.get("edizioni_escluse")),
         "edizioni_incluse": _lista_edizioni(row.get("edizioni_incluse")),
@@ -125,6 +127,7 @@ def leggi_lista_carte(sheet_csv_url):
       - lingua              (opzionale: it / en / entrambe - default entrambe)
       - foil                (opzionale: si / no / qualsiasi - default si)
       - percentile_soglia   (opzionale: numero 1-100 - default DEFAULT_PERCENTILE_SOGLIA)
+      - soglia_ribasso      (opzionale: % minimo sotto la mediana storica per il "prezzo basso" - default 5)
       - soglia_occasione    (opzionale: % di sconto del minimo rispetto alla media
                              delle 10 offerte più economiche - default DEFAULT_SOGLIA_OCCASIONE)
       - edizioni_escluse    (opzionale: codici o nomi edizione da ignorare, separati da ; )
@@ -462,6 +465,7 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
     miglior = None  # (prezzo_eur, dettagli)
     numero_offerte_valide = 0
     prezzi_validi = []
+    offerte_valide = []  # dettagli di ogni offerta valida, per mostrarle nell'app
     # per il messaggio informativo se non troviamo nulla nelle condizioni richieste
     miglior_altre_condizioni = None
 
@@ -512,6 +516,15 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
 
                     numero_offerte_valide += 1
                     prezzi_validi.append(prezzo)
+                    offerte_valide.append({
+                        "prezzo": prezzo,
+                        "condizione": condizione,
+                        "lingua": lingua,
+                        "foil": foil,
+                        "espansione": p.get("expansion", {}).get("name_en"),
+                        "venditore": user.get("username"),
+                        "quantita": p.get("quantity"),
+                    })
                     if miglior is None or prezzo < miglior[0]:
                         prezzo_nativo = p.get("price", {})
                         miglior = (prezzo, {
@@ -538,7 +551,25 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
         return None, "nessuna offerta trovata con i filtri richiesti (mercato vuoto)"
 
     miglior[1]["prezzi_offerte"] = sorted(prezzi_validi)
+    miglior[1]["offerte_riferimento"] = sorted(offerte_valide, key=lambda o: o["prezzo"])[:N_OFFERTE_RIFERIMENTO]
     return (miglior[0], miglior[1], numero_offerte_valide), None
+
+
+def valuta_prezzo_basso(prezzi_passati, prezzo, soglia_percentile, soglia_ribasso):
+    """Il prezzo è "basso" solo se valgono entrambe le condizioni:
+      1. percentile <= soglia_percentile (tra i più bassi mai visti)
+      2. almeno soglia_ribasso % sotto la mediana storica (il valore centrale
+         dei prezzi registrati): evita di segnalare variazioni di pochi
+         centesimi quando il prezzo è rimasto fermo a lungo.
+    Ritorna (percentile, mediana, ribasso_pct, e_basso) oppure None se lo
+    storico è ancora troppo corto."""
+    import statistics
+    if len(prezzi_passati) < MINIMO_PUNTI_PER_STATISTICA:
+        return None
+    percentile = calcola_percentile(prezzi_passati, prezzo)
+    mediana = statistics.median(prezzi_passati)
+    ribasso = 100 * (mediana - prezzo) / mediana if mediana > 0 else 0.0
+    return percentile, mediana, ribasso, percentile <= soglia_percentile and ribasso >= soglia_ribasso
 
 
 def analizza_occasione(prezzi_offerte, soglia_pct, n_riferimento=N_OFFERTE_RIFERIMENTO, minimo_offerte=5):
@@ -613,7 +644,7 @@ def _serie_compatta(rilevazioni, ore_dettaglio=48, ore_bucket=6):
     return [vecchi[k] for k in sorted(vecchi)] + recenti
 
 
-def scrivi_dati_app(storico, righe, percentile_default, occasione_default):
+def scrivi_dati_app(storico, righe, percentile_default, occasione_default, ribasso_default=SOGLIA_RIBASSO_PREDEFINITA):
     """Scrive data/app_data.json: per ogni carta della lista, statistiche,
     ultima offerta migliore e una serie storica ridotta per i grafici."""
     varianti = {}
@@ -625,10 +656,12 @@ def scrivi_dati_app(storico, righe, percentile_default, occasione_default):
         prezzi = [r["prezzo"] for r in record.get("rilevazioni", [])]
         soglia_p = float(riga["percentile_soglia"]) if riga["percentile_soglia"] else percentile_default
         soglia_o = float(riga["soglia_occasione"]) if riga["soglia_occasione"] else occasione_default
+        soglia_r = float(riga["soglia_ribasso"]) if riga.get("soglia_ribasso") else ribasso_default
         info = {
             "n": len(prezzi),
             "soglia_percentile": soglia_p,
             "soglia_occasione": soglia_o,
+            "soglia_ribasso": soglia_r,
             "fallimenti": record.get("fallimenti_consecutivi", 0),
             "ultimo_errore": record.get("ultimo_errore"),
             "dettaglio": record.get("ultimo_dettaglio"),
@@ -643,13 +676,14 @@ def scrivi_dati_app(storico, righe, percentile_default, occasione_default):
                 "max": max(prezzi),
                 "media": round(sum(prezzi) / len(prezzi), 4),
                 "tendenza": calcola_tendenza(prezzi[-3:]),
-                "percentile": (
-                    round(calcola_percentile(passati, ultimo), 1)
-                    if len(passati) >= MINIMO_PUNTI_PER_STATISTICA else None
-                ),
+                "percentile": None,
                 "ultimo_controllo": record["rilevazioni"][-1]["data"],
             })
-            info["prezzo_basso"] = info["percentile"] is not None and info["percentile"] <= soglia_p
+            valutazione = valuta_prezzo_basso(passati, ultimo, soglia_p, soglia_r)
+            if valutazione:
+                perc, mediana, ribasso, e_basso = valutazione
+                info.update({"percentile": round(perc, 1), "mediana": mediana, "ribasso": round(ribasso, 2)})
+            info["prezzo_basso"] = bool(valutazione and valutazione[3])
             det = info["dettaglio"] or {}
             info["occasione"] = det.get("sconto") is not None and det["sconto"] >= soglia_o
         varianti[chiave] = info

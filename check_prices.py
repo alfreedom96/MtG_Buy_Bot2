@@ -28,6 +28,8 @@ from common import (
     CardTraderClient,
     MAX_PUNTI_STORICO,
     MINIMO_PUNTI_PER_STATISTICA,
+    SOGLIA_RIBASSO_PREDEFINITA,
+    valuta_prezzo_basso,
     N_OFFERTE_RIFERIMENTO,
     SOGLIA_FALLIMENTI_CONSECUTIVI,
     calcola_percentile,
@@ -80,6 +82,7 @@ def main():
     tg_chat_id = env("TELEGRAM_CHAT_ID", "")
     percentile_default = float(env("DEFAULT_PERCENTILE_SOGLIA", "15"))
     occasione_default = float(env("DEFAULT_SOGLIA_OCCASIONE", "10"))
+    ribasso_default = float(env("DEFAULT_SOGLIA_RIBASSO", str(SOGLIA_RIBASSO_PREDEFINITA)))
 
     ct_client = CardTraderClient(ct_token)
     storico = migra_chiavi_minuscole(carica_storico())
@@ -95,6 +98,7 @@ def main():
         soglia_percentile = (
             float(riga["percentile_soglia"]) if riga["percentile_soglia"] else percentile_default
         )
+        soglia_ribasso = float(riga["soglia_ribasso"]) if riga.get("soglia_ribasso") else ribasso_default
         record = storico.get(chiave, {"rilevazioni": [], "ultima_notifica_prezzo": None})
 
         print(f"-> {nome} ...")
@@ -117,6 +121,7 @@ def main():
 
             prezzo, dettagli, numero_offerte = risultato
             prezzi_offerte = dettagli.pop("prezzi_offerte", [])
+            offerte_riferimento = dettagli.pop("offerte_riferimento", [])
             rilevazioni_passate = record.get("rilevazioni", [])
             prezzi_passati = [r["prezzo"] for r in rilevazioni_passate]
 
@@ -132,15 +137,16 @@ def main():
                     f"({len(prezzi_passati)}/{MINIMO_PUNTI_PER_STATISTICA} rilevazioni), nessuna analisi statistica"
                 )
             else:
-                percentile = calcola_percentile(prezzi_passati, prezzo)
+                percentile, mediana, ribasso, statisticamente_basso = valuta_prezzo_basso(
+                    prezzi_passati, prezzo, soglia_percentile, soglia_ribasso)
                 media = sum(prezzi_passati) / len(prezzi_passati)
                 tendenza = calcola_tendenza(prezzi_passati[-2:] + [prezzo])
                 minimo_storico = min(prezzi_passati + [prezzo])
 
-                print(f"   percentile: {percentile:.0f} (media storica: {media:.2f}€), tendenza: {tendenza}")
+                print(f"   percentile: {percentile:.0f} (soglia {soglia_percentile:.0f}), {ribasso:.1f}% sotto la mediana "
+                      f"storica {mediana:.2f}€ (soglia {soglia_ribasso:.0f}%), media storica {media:.2f}€, tendenza: {tendenza}")
 
                 ultima_notifica_prezzo = record.get("ultima_notifica_prezzo")
-                statisticamente_basso = percentile <= soglia_percentile
                 mai_notificato = ultima_notifica_prezzo is None
                 sceso_ulteriormente = (
                     ultima_notifica_prezzo is not None and prezzo < ultima_notifica_prezzo - 0.01
@@ -150,8 +156,8 @@ def main():
                     link = link_pagina_carta(nome, dettagli.get("espansione"))
                     msg = (
                         f"💰 <b>{nome}</b>\n"
-                        f"Prezzo attuale: {prezzo:.2f}€ — tra i più bassi mai visti "
-                        f"(percentile {percentile:.0f}, media storica {media:.2f}€, minimo storico {minimo_storico:.2f}€)\n"
+                        f"Prezzo attuale: {prezzo:.2f}€ — tra i più bassi mai visti, {ribasso:.0f}% sotto la mediana storica "
+                        f"(percentile {percentile:.0f}, mediana {mediana:.2f}€, minimo storico {minimo_storico:.2f}€)\n"
                         f"Tendenza recente: {tendenza}\n"
                         f"Basato su {numero_offerte} offerte valide.\n"
                         f"{dettagli['condizione']}, {dettagli['lingua'].upper()}, "
@@ -163,8 +169,8 @@ def main():
                     avvisi.invia(
                         msg,
                         f"💰 {nome} a {euro(prezzo)}",
-                        f"Tra i prezzi più bassi mai visti: percentile {percentile:.0f}, media storica "
-                        f"{euro(media)}. {dettagli['condizione']}, {dettagli['espansione']}.",
+                        f"{ribasso:.0f}% sotto la mediana storica ({euro(mediana)}), tra i prezzi più bassi mai visti. "
+                        f"{dettagli['condizione']}, {dettagli['espansione']}.",
                         url_carta_app(nome), f"basso-{chiave}",
                     )
                     record["ultima_notifica_prezzo"] = prezzo
@@ -222,6 +228,7 @@ def main():
                 "offerte_valide": numero_offerte,
                 "media20": round(analisi[0], 4) if analisi else None,  # nome storico del campo: è la media di riferimento
                 "n_riferimento": min(N_OFFERTE_RIFERIMENTO, len(prezzi_offerte)) if analisi else None,
+                "offerte": offerte_riferimento,
                 "sconto": round(analisi[1], 2) if analisi else None,
             }
 
@@ -256,7 +263,7 @@ def main():
         print("[avviso] la lista carte risulta vuota: salto la pulizia dello storico per sicurezza")
 
     salva_storico(storico)
-    scrivi_dati_app(storico, righe, percentile_default, occasione_default)
+    scrivi_dati_app(storico, righe, percentile_default, occasione_default, ribasso_default)
     print("Fatto.")
 
 

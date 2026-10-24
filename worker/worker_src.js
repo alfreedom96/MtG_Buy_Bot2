@@ -203,6 +203,7 @@ function valida(lista) {
       foil: FOIL.includes(c.foil) ? c.foil : "si",
       percentile_soglia: testo(c.percentile_soglia, 6),
       soglia_occasione: testo(c.soglia_occasione, 6),
+      soglia_ribasso: testo(c.soglia_ribasso, 6),
       edizioni_incluse: testo(c.edizioni_incluse, 2000),
       edizioni_escluse: testo(c.edizioni_escluse, 2000),
     });
@@ -233,7 +234,15 @@ async function leggiDati(env) {
     }
     return json({ generato: null, varianti: {} });
   }
-  if (!r.ok) return json({ errore: `GitHub ha risposto ${r.status} leggendo i dati` }, 502);
+  if (!r.ok) {
+    let dettaglio = "";
+    try { dettaglio = (await r.json()).message || ""; } catch (e) {}
+    const quale = env.DATA_TOKEN ? "DATA_TOKEN" : "GITHUB_TOKEN (DATA_TOKEN non è impostato)";
+    const consiglio = r.status === 403 || r.status === 401
+      ? ` Il token usato è ${quale}: deve includere il repository ${env.DATA_REPO} con il permesso Contents: Read-only.`
+      : "";
+    return json({ errore: `GitHub ha risposto ${r.status} leggendo i dati${dettaglio ? ` ("${dettaglio}")` : ""}.${consiglio}` }, 502);
+  }
   return new Response(r.body, {
     headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
   });
@@ -289,6 +298,7 @@ async function importaFoglio(env, link) {
       foil,
       percentile_soglia: col(riga, "percentile_soglia"),
       soglia_occasione: col(riga, "soglia_occasione").replace("%", ""),
+      soglia_ribasso: col(riga, "soglia_ribasso").replace("%", ""),
       edizioni_incluse: col(riga, "edizioni_incluse"),
       edizioni_escluse: col(riga, "edizioni_escluse"),
     }])[0];
