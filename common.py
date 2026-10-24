@@ -30,6 +30,7 @@ CONDIZIONI_ACCETTATE = {"Mint", "Near Mint", "Slightly Played"}
 MINIMO_PUNTI_PER_STATISTICA = 5
 MAX_PUNTI_STORICO = 5000  # circa 70 giorni con un controllo ogni 20 minuti
 SOGLIA_FALLIMENTI_CONSECUTIVI = 10  # dopo quanti fallimenti di fila avvisare
+N_OFFERTE_RIFERIMENTO = 10  # occasione: confronto con la media delle N offerte più economiche
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +126,7 @@ def leggi_lista_carte(sheet_csv_url):
       - foil                (opzionale: si / no / qualsiasi - default si)
       - percentile_soglia   (opzionale: numero 1-100 - default DEFAULT_PERCENTILE_SOGLIA)
       - soglia_occasione    (opzionale: % di sconto del minimo rispetto alla media
-                             delle 20 offerte più economiche - default DEFAULT_SOGLIA_OCCASIONE)
+                             delle 10 offerte più economiche - default DEFAULT_SOGLIA_OCCASIONE)
       - edizioni_escluse    (opzionale: codici o nomi edizione da ignorare, separati da ; )
       - edizioni_incluse    (opzionale: se compilata, considera SOLO queste edizioni)
     """
@@ -489,8 +490,8 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
     return (miglior[0], miglior[1], numero_offerte_valide), None
 
 
-def analizza_occasione(prezzi_offerte, soglia_pct, n_riferimento=20, minimo_offerte=5):
-    """Confronta l'offerta più economica con la media delle (fino a) 20 offerte
+def analizza_occasione(prezzi_offerte, soglia_pct, n_riferimento=N_OFFERTE_RIFERIMENTO, minimo_offerte=5):
+    """Confronta l'offerta più economica con la media delle (fino a) 10 offerte
     più economiche (minimo incluso). Ritorna (media, sconto_pct, e_occasione)
     oppure None se le offerte sono troppo poche per un confronto sensato."""
     if len(prezzi_offerte) < minimo_offerte:

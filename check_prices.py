@@ -28,6 +28,7 @@ from common import (
     CardTraderClient,
     MAX_PUNTI_STORICO,
     MINIMO_PUNTI_PER_STATISTICA,
+    N_OFFERTE_RIFERIMENTO,
     SOGLIA_FALLIMENTI_CONSECUTIVI,
     calcola_percentile,
     calcola_tendenza,
@@ -153,14 +154,14 @@ def main():
                     record["ultima_notifica_prezzo"] = prezzo
                     print("   -> notifica inviata")
 
-            # --- Controllo "occasione": minimo vs media delle 20 offerte più economiche ---
+            # --- Controllo "occasione": minimo vs media delle 10 offerte più economiche ---
             soglia_occ = float(riga["soglia_occasione"]) if riga.get("soglia_occasione") else occasione_default
             analisi = analizza_occasione(prezzi_offerte, soglia_occ)
             if analisi is None:
                 print(f"   occasione: troppe poche offerte ({len(prezzi_offerte)}) per il confronto")
             else:
                 media20, sconto, e_occasione = analisi
-                print(f"   occasione: media {min(20, len(prezzi_offerte))} offerte più economiche {media20:.2f}€, sconto del minimo {sconto:.1f}% (soglia {soglia_occ:.0f}%)")
+                print(f"   occasione: media {min(N_OFFERTE_RIFERIMENTO, len(prezzi_offerte))} offerte più economiche {media20:.2f}€, sconto del minimo {sconto:.1f}% (soglia {soglia_occ:.0f}%)")
                 if not e_occasione:
                     record["ultima_occasione"] = None  # si riarma per la prossima
                 else:
@@ -174,7 +175,7 @@ def main():
                         msg = (
                             f"🔥 <b>Occasione: {nome}</b>\n"
                             f"Prezzo minimo: <b>{prezzo:.2f}€</b> — {sconto:.0f}% sotto la media "
-                            f"delle {min(20, len(prezzi_offerte))} offerte più economiche ({media20:.2f}€)\n"
+                            f"delle {min(N_OFFERTE_RIFERIMENTO, len(prezzi_offerte))} offerte più economiche ({media20:.2f}€)\n"
                             f"{dettagli['condizione']}, {dettagli['lingua'].upper()}, "
                             f"{'foil' if dettagli['foil'] else 'non foil'}, {dettagli['espansione']}\n"
                             f"Venditore: {dettagli.get('venditore')} (product_id {dettagli.get('product_id')})"
@@ -196,7 +197,8 @@ def main():
                 "quantita": dettagli.get("quantita"),
                 "link": link_pagina_carta(nome, dettagli.get("espansione")),
                 "offerte_valide": numero_offerte,
-                "media20": round(analisi[0], 4) if analisi else None,
+                "media20": round(analisi[0], 4) if analisi else None,  # nome storico del campo: è la media di riferimento
+                "n_riferimento": min(N_OFFERTE_RIFERIMENTO, len(prezzi_offerte)) if analisi else None,
                 "sconto": round(analisi[1], 2) if analisi else None,
             }
 
