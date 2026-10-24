@@ -10,6 +10,12 @@ on:
     - cron: "0 */4 * * *"
   workflow_dispatch: {}  # permette di lanciarlo manualmente da GitHub o da un servizio esterno
 
+# Un solo controllo alla volta: se ne parte un altro (es. dal bottone
+# "Aggiorna" dell'app) mentre uno è in corso, aspetta invece di scontrarsi.
+concurrency:
+  group: check-prices
+  cancel-in-progress: false
+
 jobs:
   check-prices:
     runs-on: ubuntu-latest
@@ -38,6 +44,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SHEET_CSV_URL: ${{ secrets.SHEET_CSV_URL }}
+          # Se impostati, la lista carte viene letta dall'app invece che dal foglio
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
           DEFAULT_PERCENTILE_SOGLIA: "15"
         run: python check_prices.py
 
@@ -46,7 +55,7 @@ jobs:
           cd data
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add price_history.json
+          git add price_history.json app_data.json
           git diff --quiet --cached || git commit -m "Aggiorna storico prezzi [skip ci]"
           for i in 1 2 3 4 5; do
             git pull --rebase origin main && git push && break
