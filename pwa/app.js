@@ -393,7 +393,7 @@ function sezioneVariante(c) {
           <p><b>Offerta migliore: ${eur(d.prezzo)}</b></p>
           <p class="muted">${esc([d.condizione, d.lingua ? d.lingua.toUpperCase() : "", d.foil ? "foil" : "non foil", d.espansione].filter(Boolean).join(", "))}</p>
           <p class="muted">Venditore ${esc(d.venditore || "?")}${d.quantita ? `, ${d.quantita} disponibili` : ""}</p>
-          ${d.media20 != null ? `<p class="muted">Media delle ${Math.min(20, d.offerte_valide || 20)} offerte più economiche: ${eur(d.media20)} (minimo ${Math.round(d.sconto)}% sotto)</p>` : ""}
+          ${d.media20 != null ? `<p class="muted">Media delle ${d.n_riferimento || Math.min(10, d.offerte_valide || 10)} offerte più economiche: ${eur(d.media20)} (minimo ${Math.round(d.sconto)}% sotto)</p>` : ""}
           ${d.link ? `<a class="btn primary block" href="${esc(d.link)}" target="_blank" rel="noopener">Apri su CardTrader</a>` : ""}
         </div>` : ""}
       <p class="settings-line">Avvisi: prezzo sotto il ${esc(sp)}° percentile, occasione da ${esc(so)}% di sconto. Edizioni: ${esc(edizioni)}.</p>
@@ -569,7 +569,7 @@ function apriModulo(c) {
       <div><label for="s-perc">Soglia prezzo basso</label><input class="input num" id="s-perc" inputmode="numeric" placeholder="${DEF_PERCENTILE}" value="${esc(f.percentile_soglia)}">
         <div class="help">Percentile: 15 = avvisa se il prezzo è nel 15% più basso dello storico.</div></div>
       <div><label for="s-occ">Soglia occasione (%)</label><input class="input num" id="s-occ" inputmode="numeric" placeholder="${DEF_OCCASIONE}" value="${esc(f.soglia_occasione)}">
-        <div class="help">Avvisa se il minimo è almeno questo % sotto la media delle 20 offerte più economiche.</div></div>
+        <div class="help">Avvisa se il minimo è almeno questo % sotto la media delle 10 offerte più economiche.</div></div>
     </div>
     <div class="sheet-actions">
       <button class="btn" id="f-annulla">Annulla</button>
