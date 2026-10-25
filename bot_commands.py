@@ -133,6 +133,10 @@ def genera_grafico(chiave, record):
 
     fig, ax = plt.subplots(figsize=(8, 4.5))
     ax.plot(date_dt, prezzi, "-o", markersize=3, linewidth=1.5, color="#2563eb")
+    # scala minima ±5%: variazioni di pochi centesimi restano piatte
+    centro = (min(prezzi) + max(prezzi)) / 2
+    meta = max((max(prezzi) - min(prezzi)) / 2, centro * 0.05, 0.01)
+    ax.set_ylim(centro - meta * 1.1, centro + meta * 1.1)
     ax.set_title(nome_da_chiave(chiave))
     ax.set_ylabel("Prezzo (EUR)")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m"))

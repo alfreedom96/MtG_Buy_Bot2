@@ -18,6 +18,7 @@
  *       POST /api/push/rimuovi      smette di inviare notifiche a un telefono
  *       POST /api/push/prova        manda una notifica di prova
  *       POST /api/notifica          manda una notifica a tutti i telefoni (usato da GitHub Actions)
+ *       GET  /api/stato             scadenza dei token GitHub, ultime esecuzioni del controllo, telefoni
  *  3. Riceve il webhook di Telegram (POST su qualunque altro indirizzo) e
  *     avvia il workflow dei comandi del bot, come prima.
  *
@@ -151,6 +152,8 @@ async function gestisciApi(request, env, url) {
 
   if (p === "/api/dati" && m === "GET") return await leggiDati(env);
 
+  if (p === "/api/stato" && m === "GET") return json(await statoSistema(env));
+
   if (p === "/api/controlla" && m === "POST") {
     const r = await avviaWorkflow(env, "check_prices.yml", null);
     return r.ok ? json({ ok: true }) : json({ errore: `GitHub ha risposto ${r.status}: controlla GITHUB_REPO e GITHUB_TOKEN` }, 502);
@@ -204,6 +207,8 @@ function valida(lista) {
       percentile_soglia: testo(c.percentile_soglia, 6),
       soglia_occasione: testo(c.soglia_occasione, 6),
       soglia_ribasso: testo(c.soglia_ribasso, 6),
+      soglia_rialzo: testo(c.soglia_rialzo, 6),
+      prezzo_obiettivo: testo(c.prezzo_obiettivo, 10),
       edizioni_incluse: testo(c.edizioni_incluse, 2000),
       edizioni_escluse: testo(c.edizioni_escluse, 2000),
     });
@@ -299,6 +304,8 @@ async function importaFoglio(env, link) {
       percentile_soglia: col(riga, "percentile_soglia"),
       soglia_occasione: col(riga, "soglia_occasione").replace("%", ""),
       soglia_ribasso: col(riga, "soglia_ribasso").replace("%", ""),
+      soglia_rialzo: col(riga, "soglia_rialzo").replace("%", ""),
+      prezzo_obiettivo: col(riga, "prezzo_obiettivo").replace("€", ""),
       edizioni_incluse: col(riga, "edizioni_incluse"),
       edizioni_escluse: col(riga, "edizioni_escluse"),
     }])[0];
@@ -331,6 +338,40 @@ function leggiCsv(t) {
   }
   if (campo || riga.length) { riga.push(campo); righe.push(riga); }
   return righe.filter((r) => r.some((c) => c.trim()));
+}
+
+/* ------------------------------------------------------------------ stato del sistema */
+
+/* GitHub indica la scadenza dei token "fine-grained" nell'intestazione
+   github-authentication-token-expiration di ogni risposta. */
+async function statoSistema(env) {
+  const out = { token: {}, esecuzioni: [], telefoni: (await leggiIscrizioni(env)).length };
+  const scadenza = (r) => r.headers.get("github-authentication-token-expiration");
+  if (env.DATA_REPO) {
+    const nome = env.DATA_TOKEN ? "DATA_TOKEN" : "GITHUB_TOKEN";
+    const r = await fetch(`https://api.github.com/repos/${env.DATA_REPO}/contents/app_data.json`, {
+      method: "HEAD",
+      headers: { ...intestazioniGitHub(env.DATA_TOKEN || env.GITHUB_TOKEN), Accept: "application/vnd.github.raw+json" },
+    });
+    out.token.dati = { nome, ok: r.ok, codice: r.status, scadenza: scadenza(r) };
+  }
+  if (env.GITHUB_REPO) {
+    const r = await fetch(`https://api.github.com/repos/${env.GITHUB_REPO}/actions/workflows/check_prices.yml/runs?per_page=6`, {
+      headers: { ...intestazioniGitHub(env.GITHUB_TOKEN), Accept: "application/vnd.github+json" },
+    });
+    out.token.azioni = { nome: "GITHUB_TOKEN", ok: r.ok, codice: r.status, scadenza: scadenza(r) };
+    if (r.ok) {
+      const j = await r.json();
+      out.esecuzioni = (j.workflow_runs || []).map((x) => ({
+        inizio: x.run_started_at || x.created_at,
+        fine: x.updated_at,
+        stato: x.status,
+        esito: x.conclusion,
+        url: x.html_url,
+      }));
+    }
+  }
+  return out;
 }
 
 /* ------------------------------------------------------------------ impostazioni */

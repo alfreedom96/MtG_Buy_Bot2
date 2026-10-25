@@ -2,51 +2,67 @@
 """
 CardTrader Price Watch - controllo prezzi
 ------------------------------------------
-Per ogni carta del Google Sheet, trova il prezzo più basso su CardTrader
-che rispetta i filtri richiesti, aggiorna lo storico e manda una notifica
-Telegram quando il prezzo è statisticamente basso rispetto allo storico
-(percentile) e non era già stato segnalato a un prezzo pari o inferiore.
+Per ogni carta seguita (lista dell'app o del vecchio foglio Google) trova il
+prezzo più basso su CardTrader che rispetta i filtri, aggiorna lo storico e
+manda gli avvisi (notifica nell'app e, se attivo, Telegram):
 
-Manda anche un avviso "tecnico" separato se una carta fallisce per troppe
-esecuzioni consecutive (segnale di un problema di configurazione, non un
-problema di prezzo), e rimuove dallo storico le carte non più presenti
-nel foglio Google.
+  🎯 prezzo obiettivo   il prezzo è sceso sotto il valore scelto per la carta
+  🔥 occasione          il minimo è molto sotto la media delle offerte più economiche
+  💰 prezzo basso       tra i più bassi mai visti e sotto la mediana storica
+  📈 impennata          il prezzo sale rapidamente (+15% rispetto ai 3 giorni prima)
+  🆕 ristampa           è uscita (o è annunciata) una nuova stampa della carta
+  ⚠️ problemi           una carta non dà risultati da molti controlli, oppure
+                        CardTrader rifiuta il token (un solo avviso, non uno per carta)
 
-Variabili d'ambiente richieste:
-    CARDTRADER_TOKEN          Token API di CardTrader (Bearer token)
-    TELEGRAM_BOT_TOKEN        Token del bot Telegram
-    TELEGRAM_CHAT_ID          Chat ID a cui mandare le notifiche
-    WORKER_URL + APP_PASSWORD Lista carte dall'app (Cloudflare Worker), oppure
-    SHEET_CSV_URL             link CSV pubblico del Google Sheet (vecchio metodo)
-    DEFAULT_PERCENTILE_SOGLIA Percentile di default sotto il quale un
-                              prezzo è considerato "basso" (es. 15)
+Salva anche, per l'app: il prezzo Cardmarket (preso da Scryfall), il minimo
+assoluto su CardTrader (anche venditori senza CardTrader Zero) e lo stato
+del sistema. Il lunedì mattina manda un riepilogo settimanale nell'app.
+
+Variabili d'ambiente:
+    CARDTRADER_TOKEN          Token API di CardTrader (obbligatorio)
+    TELEGRAM_BOT_TOKEN        Token del bot Telegram (facoltativo)
+    TELEGRAM_CHAT_ID          Chat ID Telegram (facoltativo)
+    WORKER_URL + APP_PASSWORD Lista carte e notifiche dell'app, oppure
+    SHEET_CSV_URL             link CSV pubblico del foglio Google (vecchio metodo)
+    DEFAULT_PERCENTILE_SOGLIA, DEFAULT_SOGLIA_OCCASIONE, DEFAULT_SOGLIA_RIBASSO,
+    DEFAULT_SOGLIA_RIALZO     soglie predefinite (facoltative)
 """
 
+import base64
+import json
 import time
+from datetime import datetime, timezone
+
+import requests
 
 from common import (
-    CardTraderClient,
     MAX_PUNTI_STORICO,
     MINIMO_PUNTI_PER_STATISTICA,
-    SOGLIA_RIBASSO_PREDEFINITA,
-    valuta_prezzo_basso,
-    N_OFFERTE_RIFERIMENTO,
     SOGLIA_FALLIMENTI_CONSECUTIVI,
-    calcola_percentile,
+    SOGLIA_RIALZO_PREDEFINITA,
+    SOGLIA_RIBASSO_PREDEFINITA,
+    Avvisi,
+    CardTraderClient,
+    _valore,
+    analizza_occasione,
     calcola_tendenza,
     carica_storico,
     chiave_carta,
-    leggi_lista_carte_configurata,
-    migra_chiavi_minuscole,
-    scrivi_dati_app,
     env,
-    Avvisi,
-    url_carta_app,
+    invia_notifica_app,
+    leggi_lista_carte_configurata,
     link_pagina_carta,
-    analizza_occasione,
+    migra_chiavi_minuscole,
     miglior_prezzo,
     salva_storico,
+    scrivi_dati_app,
+    url_carta_app,
+    valuta_prezzo_basso,
+    valuta_rialzo,
 )
+from mercato import CacheCarte, prezzo_cardmarket
+
+ORE_TRA_PREZZI_CARDMARKET = 6
 
 
 def euro(x):
@@ -54,10 +70,37 @@ def euro(x):
     return f"{x:.2f} €".replace(".", ",")
 
 
+def ora_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def scadenza_token(token):
+    """Se il token è un JWT (JSON Web Token, il formato usato da CardTrader)
+    legge la data di scadenza. Ritorna una data ISO o None."""
+    try:
+        parte = token.split(".")[1]
+        parte += "=" * (-len(parte) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(parte)).get("exp")
+        return datetime.fromtimestamp(int(exp), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if exp else None
+    except Exception:
+        return None
+
+
+def token_rifiutato(errore):
+    return (
+        isinstance(errore, requests.HTTPError)
+        and errore.response is not None
+        and errore.response.status_code in (401, 403)
+    )
+
+
+def descrizione_dettagli(d):
+    return f"{d['condizione']}, {d['lingua'].upper()}, {'foil' if d['foil'] else 'non foil'}, {d['espansione']}"
+
+
 def gestisci_fallimento(record, nome, motivo, avvisi):
-    """Aggiorna il contatore di fallimenti consecutivi per una carta e, se
-    supera la soglia, manda un avviso tecnico una sola volta (finché non
-    torna a funzionare)."""
+    """Conta i fallimenti consecutivi di una carta e, oltre la soglia, manda
+    un avviso tecnico una sola volta (finché non torna a funzionare)."""
     record["fallimenti_consecutivi"] = record.get("fallimenti_consecutivi", 0) + 1
     record["ultimo_errore"] = motivo
     if (
@@ -76,45 +119,249 @@ def gestisci_fallimento(record, nome, motivo, avvisi):
         record["allarme_fallimento_inviato"] = True
 
 
+def avvisa_ristampe(nome, nuove, avvisi):
+    for s in nuove:
+        uscita = s.get("uscita") or ""
+        try:
+            data = datetime.strptime(uscita, "%Y-%m-%d").strftime("%d/%m/%Y")
+            futura = uscita > time.strftime("%Y-%m-%d")
+        except ValueError:
+            data, futura = uscita, False
+        quando = f"in uscita il {data}" if futura else f"uscita il {data}"
+        avvisi.invia(
+            f"🆕 <b>Ristampa: {nome}</b>\n{s['nome_set']} ({quando}).\n"
+            f"Spesso dopo una ristampa il prezzo scende: può convenire aspettare.",
+            f"🆕 Ristampa: {nome}",
+            f"{s['nome_set']}, {quando}. Spesso dopo una ristampa il prezzo scende: può convenire aspettare.",
+            url_carta_app(nome), f"ristampa-{nome.lower()}-{s['set']}",
+        )
+        print(f"   -> avviso RISTAMPA: {s['nome_set']}")
+
+
+def aggiorna_cardmarket(record, stampe, riga):
+    """Aggiunge un punto alla serie Cardmarket se il prezzo è cambiato o se
+    sono passate almeno 6 ore dall'ultimo (Scryfall lo aggiorna una volta al giorno)."""
+    cm = prezzo_cardmarket(stampe, riga["foil"], riga.get("edizioni_escluse"), riga.get("edizioni_incluse"))
+    if not cm:
+        return None
+    serie = record.setdefault("cardmarket", [])
+    ultimo = serie[-1] if serie else None
+    vecchio = ultimo is None or time.time() - (datetime.strptime(ultimo["data"], "%Y-%m-%dT%H:%M:%SZ")
+                                               .replace(tzinfo=timezone.utc).timestamp()) >= ORE_TRA_PREZZI_CARDMARKET * 3600
+    if ultimo is None or abs(ultimo["prezzo"] - cm[0]) >= 0.005 or vecchio:
+        serie.append({"data": ora_iso(), "prezzo": cm[0], "set": cm[1]})
+        del serie[:-2000]
+    return cm
+
+
+def controlla_obiettivo(record, nome, chiave, prezzo, obiettivo, dettagli, avvisi):
+    """🎯 Avvisa quando il prezzo scende sotto l'obiettivo. Non ripete finché
+    il prezzo non torna sopra, salvo un ulteriore calo di almeno il 5%."""
+    if obiettivo is None:
+        return
+    if prezzo > obiettivo:
+        record["obiettivo_notificato"] = None
+        return
+    ultimo = record.get("obiettivo_notificato")
+    if ultimo is not None and prezzo > ultimo * 0.95:
+        return
+    link = link_pagina_carta(nome, dettagli.get("espansione"))
+    avvisi.invia(
+        f"🎯 <b>{nome}</b> a {euro(prezzo)}, sotto il tuo obiettivo di {euro(obiettivo)}\n"
+        f"{descrizione_dettagli(dettagli)}\nVenditore: {dettagli.get('venditore')}"
+        + (f"\n🔗 {link}" if link else ""),
+        f"🎯 {nome} a {euro(prezzo)}",
+        f"Sotto il tuo obiettivo di {euro(obiettivo)}. {dettagli['condizione']}, {dettagli['espansione']}, "
+        f"venditore {dettagli.get('venditore')}.",
+        url_carta_app(nome), f"obiettivo-{chiave}",
+    )
+    record["obiettivo_notificato"] = prezzo
+    print("   -> avviso OBIETTIVO inviato")
+
+
+def controlla_rialzo(record, nome, chiave, rilevazioni, soglia, avvisi):
+    """📈 Avvisa quando il prezzo sale rapidamente. Ripete solo se sale di
+    un'altra soglia rispetto all'ultimo avviso; si riarma quando il rialzo rientra."""
+    r = valuta_rialzo(rilevazioni, soglia)
+    if not r:
+        return
+    print(f"   rialzo: livello {r['livello']:.2f}€ contro {r['riferimento']:.2f}€ dei giorni prima "
+          f"({r['rialzo']:+.1f}%, soglia {soglia:.0f}%)")
+    if not r["attivo"]:
+        record["rialzo_notificato"] = None
+        return
+    ultimo = record.get("rialzo_notificato")
+    if ultimo is not None and r["livello"] < ultimo * (1 + soglia / 100):
+        return
+    avvisi.invia(
+        f"📈 <b>{nome}</b> in rialzo: {euro(r['livello'])}, +{r['rialzo']:.0f}% rispetto ai giorni precedenti "
+        f"({euro(r['riferimento'])}).\nSe ti serve, potrebbe convenire comprare prima che salga ancora.",
+        f"📈 {nome} in rialzo: +{r['rialzo']:.0f}%",
+        f"Ora {euro(r['livello'])}, nei giorni precedenti {euro(r['riferimento'])}. "
+        f"Se ti serve, potrebbe convenire comprare prima che salga ancora.",
+        url_carta_app(nome), f"rialzo-{chiave}",
+    )
+    record["rialzo_notificato"] = r["livello"]
+    print("   -> avviso RIALZO inviato")
+
+
+def controlla_prezzo_basso(record, nome, chiave, prezzo, prezzi_passati, soglie, dettagli, numero_offerte, avvisi):
+    if len(prezzi_passati) < MINIMO_PUNTI_PER_STATISTICA:
+        print(f"   ancora in fase di raccolta dati ({len(prezzi_passati)}/{MINIMO_PUNTI_PER_STATISTICA} rilevazioni)")
+        return
+    percentile, mediana, ribasso, basso = valuta_prezzo_basso(
+        prezzi_passati, prezzo, soglie["percentile"], soglie["ribasso"])
+    media = sum(prezzi_passati) / len(prezzi_passati)
+    tendenza = calcola_tendenza(prezzi_passati[-2:] + [prezzo])
+    minimo_storico = min(prezzi_passati + [prezzo])
+    print(f"   percentile: {percentile:.0f} (soglia {soglie['percentile']:.0f}), {ribasso:.1f}% sotto la mediana "
+          f"storica {mediana:.2f}€ (soglia {soglie['ribasso']:.0f}%), tendenza: {tendenza}")
+    ultima = record.get("ultima_notifica_prezzo")
+    if basso and (ultima is None or prezzo < ultima - 0.01):
+        link = link_pagina_carta(nome, dettagli.get("espansione"))
+        avvisi.invia(
+            f"💰 <b>{nome}</b>\n"
+            f"Prezzo attuale: {prezzo:.2f}€ — tra i più bassi mai visti, {ribasso:.0f}% sotto la mediana storica "
+            f"(percentile {percentile:.0f}, mediana {mediana:.2f}€, media {media:.2f}€, minimo storico {minimo_storico:.2f}€)\n"
+            f"Tendenza recente: {tendenza}\nBasato su {numero_offerte} offerte valide.\n"
+            f"{descrizione_dettagli(dettagli)}\nVenditore: {dettagli.get('venditore')}"
+            + (f"\n🔗 {link}" if link else ""),
+            f"💰 {nome} a {euro(prezzo)}",
+            f"{ribasso:.0f}% sotto la mediana storica ({euro(mediana)}), tra i prezzi più bassi mai visti. "
+            f"{dettagli['condizione']}, {dettagli['espansione']}.",
+            url_carta_app(nome), f"basso-{chiave}",
+        )
+        record["ultima_notifica_prezzo"] = prezzo
+        print("   -> avviso PREZZO BASSO inviato")
+
+
+def controlla_occasione(record, nome, chiave, prezzo, prezzi_offerte, soglia, dettagli, avvisi):
+    analisi = analizza_occasione(prezzi_offerte, soglia)
+    if analisi is None:
+        print(f"   occasione: troppe poche offerte ({len(prezzi_offerte)}) per il confronto")
+        return None
+    media, sconto, n = analisi["media"], analisi["sconto"], analisi["usate"]
+    nota = f" ({analisi['escluse']} escluse perché oltre {analisi['limite']:.2f}€)" if analisi["escluse"] else ""
+    print(f"   occasione: media {n} offerte più economiche {media:.2f}€{nota}, sconto {sconto:.1f}% (soglia {soglia:.0f}%)")
+    if not analisi["occasione"]:
+        record["ultima_occasione"] = None  # si riarma per la prossima
+        return analisi
+    ultima = record.get("ultima_occasione") or {}
+    if ultima.get("product_id") == dettagli.get("product_id") and prezzo >= ultima.get("prezzo", 1e9) - 0.01:
+        return analisi
+    link = link_pagina_carta(nome, dettagli.get("espansione"))
+    avvisi.invia(
+        f"🔥 <b>Occasione: {nome}</b>\n"
+        f"Prezzo minimo: <b>{prezzo:.2f}€</b> — {sconto:.0f}% sotto la media delle {n} offerte più economiche ({media:.2f}€)\n"
+        f"{descrizione_dettagli(dettagli)}\nVenditore: {dettagli.get('venditore')}"
+        + (f"\n🔗 {link}" if link else ""),
+        f"🔥 Occasione: {nome} a {euro(prezzo)}",
+        f"{sconto:.0f}% sotto la media delle {n} offerte più economiche ({euro(media)}). "
+        f"{dettagli['condizione']}, {dettagli['espansione']}, venditore {dettagli.get('venditore')}.",
+        url_carta_app(nome), f"occasione-{chiave}",
+    )
+    record["ultima_occasione"] = {"product_id": dettagli.get("product_id"), "prezzo": prezzo}
+    print("   -> avviso OCCASIONE inviato")
+    return analisi
+
+
+def riepilogo_settimanale(varianti, righe, cache):
+    """Il lunedì dalle 8 (ora UTC) manda una volta sola un riepilogo nell'app."""
+    adesso = datetime.now(timezone.utc)
+    settimana = adesso.strftime("%G-W%V")
+    if adesso.weekday() != 0 or adesso.hour < 8 or cache.meta.get("ultimo_riepilogo") == settimana:
+        return
+    nomi = {chiave_carta(r): r["nome_carta"] for r in righe}
+    conta = lambda campo: sum(1 for v in varianti.values() if v.get(campo))
+    rialzi = sum(1 for v in varianti.values() if (v.get("rialzo") or {}).get("attivo"))
+    cali = sorted(((v["var7"], k) for k, v in varianti.items() if v.get("var7") is not None), key=lambda x: x[0])
+    parti = []
+    for n, testo in ((conta("sotto_obiettivo"), "sotto obiettivo"), (conta("occasione"), "occasioni"),
+                     (conta("prezzo_basso"), "prezzi bassi"), (rialzi, "in rialzo")):
+        if n:
+            parti.append(f"{n} {testo}")
+    testo = (", ".join(parti) if parti else "Nessuna segnalazione") + "."
+    if cali and cali[0][0] < 0:
+        testo += f" Calo maggiore in 7 giorni: {nomi.get(cali[0][1], cali[0][1])} {cali[0][0]:.0f}%."
+    if cali and cali[-1][0] > 0:
+        testo += f" Rialzo maggiore: {nomi.get(cali[-1][1], cali[-1][1])} +{cali[-1][0]:.0f}%."
+    invia_notifica_app(f"📊 Riepilogo settimanale ({len(righe)} varianti seguite)", testo, "/", "riepilogo")
+    cache.meta["ultimo_riepilogo"] = settimana
+    print(f"Riepilogo settimanale inviato: {testo}")
+
+
 def main():
+    inizio = time.time()
     ct_token = env("CARDTRADER_TOKEN", required=True)
     tg_token = env("TELEGRAM_BOT_TOKEN", "")
     tg_chat_id = env("TELEGRAM_CHAT_ID", "")
-    percentile_default = float(env("DEFAULT_PERCENTILE_SOGLIA", "15"))
-    occasione_default = float(env("DEFAULT_SOGLIA_OCCASIONE", "10"))
-    ribasso_default = float(env("DEFAULT_SOGLIA_RIBASSO", str(SOGLIA_RIBASSO_PREDEFINITA)))
+    soglie_predefinite = {
+        "percentile": float(env("DEFAULT_PERCENTILE_SOGLIA", "15")),
+        "occasione": float(env("DEFAULT_SOGLIA_OCCASIONE", "10")),
+        "ribasso": float(env("DEFAULT_SOGLIA_RIBASSO", str(SOGLIA_RIBASSO_PREDEFINITA))),
+        "rialzo": float(env("DEFAULT_SOGLIA_RIALZO", str(SOGLIA_RIALZO_PREDEFINITA))),
+    }
 
     ct_client = CardTraderClient(ct_token)
     storico = migra_chiavi_minuscole(carica_storico())
+    cache = CacheCarte()
     righe, fonte, impostazioni = leggi_lista_carte_configurata()
     avvisi = Avvisi(tg_token, tg_chat_id, impostazioni)
-    print(f"Avvisi: app {'sì' if fonte == 'app' else 'no'}, Telegram {'sì' if avvisi.telegram else 'no'}")
+    meta = {"cardtrader_scadenza": scadenza_token(ct_token), "n_carte": len(righe), "errore_globale": None}
+    print(f"Carte da controllare: {len(righe)} (lista letta da: {fonte}); "
+          f"avvisi: app {'sì' if fonte == 'app' else 'no'}, Telegram {'sì' if avvisi.telegram else 'no'}")
 
-    print(f"Carte da controllare: {len(righe)} (lista letta da: {fonte})")
+    # --- Il token CardTrader funziona? Se no: un solo avviso, non uno per carta ---
+    try:
+        ct_client.espansioni_magic()
+        token_ok = True
+    except requests.HTTPError as e:
+        if not token_rifiutato(e):
+            raise
+        token_ok = False
+        meta["errore_globale"] = (f"CardTrader rifiuta il token (errore {e.response.status_code}): "
+                                  f"i prezzi non si aggiornano. Controlla il secret CARDTRADER_TOKEN su GitHub.")
+        print(meta["errore_globale"])
+        if not cache.meta.get("allarme_token"):
+            avvisi.invia(f"🔒 <b>{meta['errore_globale']}</b>", "🔒 CardTrader rifiuta il token",
+                         meta["errore_globale"], "/", "token-cardtrader")
+            cache.meta["allarme_token"] = True
+    if token_ok and cache.meta.get("allarme_token"):
+        avvisi.invia("✅ CardTrader accetta di nuovo il token: i controlli prezzi sono ripartiti.",
+                     "✅ CardTrader di nuovo raggiungibile", "I controlli prezzi sono ripartiti.", "/", "token-cardtrader")
+        cache.meta["allarme_token"] = False
 
-    for riga in righe:
+    for riga in (righe if token_ok else []):
         nome = riga["nome_carta"]
         chiave = chiave_carta(riga)
-        soglia_percentile = (
-            float(riga["percentile_soglia"]) if riga["percentile_soglia"] else percentile_default
-        )
-        soglia_ribasso = float(riga["soglia_ribasso"]) if riga.get("soglia_ribasso") else ribasso_default
+        soglie = {
+            "percentile": _valore(riga, "percentile_soglia", soglie_predefinite["percentile"]),
+            "occasione": _valore(riga, "soglia_occasione", soglie_predefinite["occasione"]),
+            "ribasso": _valore(riga, "soglia_ribasso", soglie_predefinite["ribasso"]),
+            "rialzo": _valore(riga, "soglia_rialzo", soglie_predefinite["rialzo"]),
+        }
+        obiettivo = _valore(riga, "prezzo_obiettivo", None)
         record = storico.get(chiave, {"rilevazioni": [], "ultima_notifica_prezzo": None})
 
         print(f"-> {nome} ...")
         try:
+            # Stampe e prezzo Cardmarket (dalla memoria, aggiornati ogni 6 ore)
+            stampe, nuove = cache.stampe(nome)
+            avvisa_ristampe(nome, nuove, avvisi)
+            cm = aggiorna_cardmarket(record, stampe, riga)
+            if cm:
+                print(f"   Cardmarket: {cm[0]:.2f}€ ({cm[1]})")
+
             risultato, errore = miglior_prezzo(
                 ct_client, nome, riga["lingua"], riga["foil"],
-                riga.get("edizioni_escluse"), riga.get("edizioni_incluse"),
+                riga.get("edizioni_escluse"), riga.get("edizioni_incluse"), cache,
             )
-
             if errore:
                 print(f"   {errore}")
                 gestisci_fallimento(record, nome, errore, avvisi)
                 storico[chiave] = record
                 continue
 
-            # successo: azzeriamo il contatore di fallimenti
             record["fallimenti_consecutivi"] = 0
             record["allarme_fallimento_inviato"] = False
             record["ultimo_errore"] = None
@@ -122,98 +369,16 @@ def main():
             prezzo, dettagli, numero_offerte = risultato
             prezzi_offerte = dettagli.pop("prezzi_offerte", [])
             offerte_riferimento = dettagli.pop("offerte_riferimento", [])
-            rilevazioni_passate = record.get("rilevazioni", [])
-            prezzi_passati = [r["prezzo"] for r in rilevazioni_passate]
+            assoluto = dettagli.pop("minimo_assoluto", None)
+            rilevazioni = record.get("rilevazioni", [])
+            prezzi_passati = [r["prezzo"] for r in rilevazioni]
+            print(f"   prezzo: {prezzo:.2f}€ ({descrizione_dettagli(dettagli)}, venditore {dettagli.get('venditore')}, "
+                  f"{numero_offerte} offerte valide)"
+                  + (f"; minimo assoluto {assoluto['prezzo']:.2f}€ ({assoluto['venditore']})" if assoluto else ""))
 
-            print(
-                f"   prezzo trovato: {prezzo:.2f} EUR ({dettagli}, {numero_offerte} offerte valide) "
-                f"[venditore: {dettagli.get('venditore')}, product_id: {dettagli.get('product_id')}, "
-                f"blueprint_id: {dettagli.get('blueprint_id')}, prezzo nativo venditore: {dettagli.get('prezzo_nativo')}]"
-            )
-
-            if len(prezzi_passati) < MINIMO_PUNTI_PER_STATISTICA:
-                print(
-                    f"   ancora in fase di raccolta dati "
-                    f"({len(prezzi_passati)}/{MINIMO_PUNTI_PER_STATISTICA} rilevazioni), nessuna analisi statistica"
-                )
-            else:
-                percentile, mediana, ribasso, statisticamente_basso = valuta_prezzo_basso(
-                    prezzi_passati, prezzo, soglia_percentile, soglia_ribasso)
-                media = sum(prezzi_passati) / len(prezzi_passati)
-                tendenza = calcola_tendenza(prezzi_passati[-2:] + [prezzo])
-                minimo_storico = min(prezzi_passati + [prezzo])
-
-                print(f"   percentile: {percentile:.0f} (soglia {soglia_percentile:.0f}), {ribasso:.1f}% sotto la mediana "
-                      f"storica {mediana:.2f}€ (soglia {soglia_ribasso:.0f}%), media storica {media:.2f}€, tendenza: {tendenza}")
-
-                ultima_notifica_prezzo = record.get("ultima_notifica_prezzo")
-                mai_notificato = ultima_notifica_prezzo is None
-                sceso_ulteriormente = (
-                    ultima_notifica_prezzo is not None and prezzo < ultima_notifica_prezzo - 0.01
-                )
-
-                if statisticamente_basso and (mai_notificato or sceso_ulteriormente):
-                    link = link_pagina_carta(nome, dettagli.get("espansione"))
-                    msg = (
-                        f"💰 <b>{nome}</b>\n"
-                        f"Prezzo attuale: {prezzo:.2f}€ — tra i più bassi mai visti, {ribasso:.0f}% sotto la mediana storica "
-                        f"(percentile {percentile:.0f}, mediana {mediana:.2f}€, minimo storico {minimo_storico:.2f}€)\n"
-                        f"Tendenza recente: {tendenza}\n"
-                        f"Basato su {numero_offerte} offerte valide.\n"
-                        f"{dettagli['condizione']}, {dettagli['lingua'].upper()}, "
-                        f"{'foil' if dettagli['foil'] else 'non foil'}, {dettagli['espansione']}\n"
-                        f"Venditore: {dettagli.get('venditore')} (product_id {dettagli.get('product_id')})"
-                    )
-                    if link:
-                        msg += f"\n🔗 {link}"
-                    avvisi.invia(
-                        msg,
-                        f"💰 {nome} a {euro(prezzo)}",
-                        f"{ribasso:.0f}% sotto la mediana storica ({euro(mediana)}), tra i prezzi più bassi mai visti. "
-                        f"{dettagli['condizione']}, {dettagli['espansione']}.",
-                        url_carta_app(nome), f"basso-{chiave}",
-                    )
-                    record["ultima_notifica_prezzo"] = prezzo
-                    print("   -> notifica inviata")
-
-            # --- Controllo "occasione": minimo vs media delle 10 offerte più economiche ---
-            soglia_occ = float(riga["soglia_occasione"]) if riga.get("soglia_occasione") else occasione_default
-            analisi = analizza_occasione(prezzi_offerte, soglia_occ)
-            if analisi is None:
-                print(f"   occasione: troppe poche offerte ({len(prezzi_offerte)}) per il confronto")
-            else:
-                media20, sconto, e_occasione = analisi
-                print(f"   occasione: media {min(N_OFFERTE_RIFERIMENTO, len(prezzi_offerte))} offerte più economiche {media20:.2f}€, sconto del minimo {sconto:.1f}% (soglia {soglia_occ:.0f}%)")
-                if not e_occasione:
-                    record["ultima_occasione"] = None  # si riarma per la prossima
-                else:
-                    ultima = record.get("ultima_occasione") or {}
-                    nuova = (
-                        ultima.get("product_id") != dettagli.get("product_id")
-                        or prezzo < ultima.get("prezzo", 1e9) - 0.01
-                    )
-                    if nuova:
-                        link = link_pagina_carta(nome, dettagli.get("espansione"))
-                        msg = (
-                            f"🔥 <b>Occasione: {nome}</b>\n"
-                            f"Prezzo minimo: <b>{prezzo:.2f}€</b> — {sconto:.0f}% sotto la media "
-                            f"delle {min(N_OFFERTE_RIFERIMENTO, len(prezzi_offerte))} offerte più economiche ({media20:.2f}€)\n"
-                            f"{dettagli['condizione']}, {dettagli['lingua'].upper()}, "
-                            f"{'foil' if dettagli['foil'] else 'non foil'}, {dettagli['espansione']}\n"
-                            f"Venditore: {dettagli.get('venditore')} (product_id {dettagli.get('product_id')})"
-                        )
-                        if link:
-                            msg += f"\n🔗 {link}"
-                        avvisi.invia(
-                            msg,
-                            f"🔥 Occasione: {nome} a {euro(prezzo)}",
-                            f"{sconto:.0f}% sotto la media delle {min(N_OFFERTE_RIFERIMENTO, len(prezzi_offerte))} "
-                            f"offerte più economiche ({euro(media20)}). {dettagli['condizione']}, "
-                            f"{dettagli['espansione']}, venditore {dettagli.get('venditore')}.",
-                            url_carta_app(nome), f"occasione-{chiave}",
-                        )
-                        record["ultima_occasione"] = {"product_id": dettagli.get("product_id"), "prezzo": prezzo}
-                        print("   -> notifica OCCASIONE inviata")
+            controlla_obiettivo(record, nome, chiave, prezzo, obiettivo, dettagli, avvisi)
+            controlla_prezzo_basso(record, nome, chiave, prezzo, prezzi_passati, soglie, dettagli, numero_offerte, avvisi)
+            analisi = controlla_occasione(record, nome, chiave, prezzo, prezzi_offerte, soglie["occasione"], dettagli, avvisi)
 
             # Dettaglio dell'offerta migliore, mostrato nell'app
             record["ultimo_dettaglio"] = {
@@ -226,45 +391,55 @@ def main():
                 "quantita": dettagli.get("quantita"),
                 "link": link_pagina_carta(nome, dettagli.get("espansione")),
                 "offerte_valide": numero_offerte,
-                "media20": round(analisi[0], 4) if analisi else None,  # nome storico del campo: è la media di riferimento
-                "n_riferimento": min(N_OFFERTE_RIFERIMENTO, len(prezzi_offerte)) if analisi else None,
-                "offerte": offerte_riferimento,
-                "sconto": round(analisi[1], 2) if analisi else None,
+                "media20": round(analisi["media"], 4) if analisi else None,  # nome storico: media di riferimento
+                "n_riferimento": analisi["usate"] if analisi else None,
+                "escluse": analisi["escluse"] if analisi else 0,
+                "limite_fuori_scala": round(analisi["limite"], 2) if analisi else None,
+                "offerte": [{**o, "esclusa": bool(analisi and o["prezzo"] > analisi["limite"])} for o in offerte_riferimento],
+                "sconto": round(analisi["sconto"], 2) if analisi else None,
+                "assoluto": assoluto,
             }
 
-            rilevazioni_passate.append({
-                "data": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            rilevazioni.append({
+                "data": ora_iso(),
                 "prezzo": prezzo,
+                # chiavi corte: il file ha migliaia di righe
+                "v": dettagli.get("venditore"),     # chi offriva il prezzo migliore
+                "e": dettagli.get("espansione"),    # di quale edizione
+                "a": assoluto["prezzo"] if assoluto else None,  # minimo anche senza CardTrader Zero
             })
-            record["rilevazioni"] = rilevazioni_passate[-MAX_PUNTI_STORICO:]
+            record["rilevazioni"] = rilevazioni[-MAX_PUNTI_STORICO:]
+            controlla_rialzo(record, nome, chiave, record["rilevazioni"], soglie["rialzo"], avvisi)
             storico[chiave] = record
 
         except Exception as e:
-            # Non blocchiamo mai il controllo delle altre carte per un
-            # problema isolato su una singola riga del foglio.
+            if token_rifiutato(e):
+                meta["errore_globale"] = "CardTrader ha rifiutato il token durante il controllo: controlla CARDTRADER_TOKEN."
+                print(meta["errore_globale"])
+                break
+            # un problema su una carta non blocca le altre
             print(f"   [errore] problema imprevisto con '{nome}', la salto: {e}")
             gestisci_fallimento(record, nome, str(e), avvisi)
             storico[chiave] = record
-            continue
 
-    # Rimuove dallo storico le carte non più presenti nel foglio: da quel
-    # momento non compariranno più nei riepiloghi né saranno cercabili con
-    # /grafico, dato che l'utente ha scelto di non seguirle più.
-    # Protezione: se il foglio risultasse vuoto per un problema temporaneo
-    # di lettura (non un errore vero e proprio, es. un formato inatteso),
-    # meglio non cancellare tutto lo storico per sbaglio.
+    # Rimuove dallo storico e dalla memoria le carte non più seguite (solo se
+    # la lista non è vuota: una lista vuota per errore non deve cancellare tutto)
     if righe:
-        chiavi_attuali = {chiave_carta(riga) for riga in righe}
-        chiavi_da_rimuovere = set(storico.keys()) - chiavi_attuali
-        for chiave in chiavi_da_rimuovere:
-            print(f"Rimuovo dallo storico (non più nel foglio): {chiave}")
+        chiavi_attuali = {chiave_carta(r) for r in righe}
+        for chiave in set(storico) - chiavi_attuali:
+            print(f"Rimuovo dallo storico (non più seguita): {chiave}")
             del storico[chiave]
+        cache.tieni_solo([r["nome_carta"] for r in righe])
     else:
         print("[avviso] la lista carte risulta vuota: salto la pulizia dello storico per sicurezza")
 
+    meta["durata_s"] = round(time.time() - inizio)
     salva_storico(storico)
-    scrivi_dati_app(storico, righe, percentile_default, occasione_default, ribasso_default)
-    print("Fatto.")
+    varianti = scrivi_dati_app(storico, righe, soglie_predefinite, meta)
+    if token_ok:
+        riepilogo_settimanale(varianti, righe, cache)
+    cache.salva()
+    print(f"Fatto in {meta['durata_s']} secondi.")
 
 
 if __name__ == "__main__":

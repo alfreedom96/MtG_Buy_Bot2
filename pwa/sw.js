@@ -2,7 +2,7 @@
    - guscio dell'app: dalla cache, aggiornato in background
    - /api/dati e /api/carte: prima dalla rete, dalla cache se offline
    - immagini Scryfall e font: dalla cache dopo il primo download */
-const VERSIONE = "pw-v4";
+const VERSIONE = "pw-v7";
 const GUSCIO = ["/", "/app.js", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png", "/badge.png"];
 
 self.addEventListener("install", (e) => {

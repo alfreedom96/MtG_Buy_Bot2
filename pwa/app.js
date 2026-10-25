@@ -5,6 +5,7 @@
 const DEF_PERCENTILE = 15;
 const DEF_OCCASIONE = 10;
 const DEF_RIBASSO = 5;
+const DEF_RIALZO = 15;
 const SCRYFALL = "https://api.scryfall.com";
 
 const S = {
@@ -14,6 +15,7 @@ const S = {
   filtro: "tutte",
   range: {},
   polling: null,
+  ordine: leggiLocale("ordine") || "segnalazioni",
   impostazioni: { telegram: true },
   caricato: false,
 };
@@ -139,6 +141,18 @@ function aggiornaSpinner(on) {
 
 function info(c) { return S.dati.varianti[chiave(c)]; }
 
+/* Tutte le segnalazioni attive di una variante, dalla più importante */
+function segnali(c) {
+  const v = info(c);
+  if (!v || v.prezzo == null) return [];
+  const out = [];
+  if (v.sotto_obiettivo) out.push({ cls: "mythic", tipo: "obiettivo", testo: `Sotto il tuo obiettivo di ${eur(v.obiettivo)}` });
+  if (v.occasione) out.push({ cls: "mythic", tipo: "occasione", testo: `Occasione: ${Math.round(v.dettaglio.sconto)}% sotto la media delle offerte più economiche` });
+  if (v.prezzo_basso) out.push({ cls: "gold", tipo: "basso", testo: `Prezzo basso: ${Math.round(v.ribasso)}% sotto la mediana storica, tra i più bassi mai registrati` });
+  if (v.rialzo && v.rialzo.attivo) out.push({ cls: "rise", tipo: "rialzo", testo: `In rialzo: +${Math.round(v.rialzo.rialzo)}% rispetto ai 3 giorni precedenti` });
+  return out;
+}
+
 function stato(c) {
   const v = info(c);
   if (!v || v.prezzo == null) {
@@ -146,17 +160,11 @@ function stato(c) {
     return { cls: "wait", testo: "In attesa del primo controllo" };
   }
   if (v.fallimenti >= 3) return { cls: "err", testo: `Ultimi ${v.fallimenti} controlli falliti: ${v.ultimo_errore || ""}` };
-  if (v.occasione) {
-    const sc = Math.round(v.dettaglio.sconto);
-    return { cls: "mythic", testo: `Occasione: ${sc}% sotto la media delle offerte più economiche` };
-  }
-  if (v.prezzo_basso) {
-    return { cls: "gold", testo: `Prezzo basso: ${Math.round(v.ribasso)}% sotto la mediana storica, tra i più bassi mai registrati` };
-  }
-  return { cls: "", testo: "" };
+  return segnali(c)[0] || { cls: "", testo: "" };
 }
 
-const PESO = { mythic: 0, gold: 1, "": 2, wait: 3, err: 4 };
+const PESO = { mythic: 0, gold: 1, rise: 2, "": 3, wait: 4, err: 5 };
+const ha = (g, tipi) => g.varianti.some((c) => segnali(c).some((x) => tipi.includes(x.tipo)));
 
 function gruppi() {
   const m = new Map();
@@ -166,8 +174,19 @@ function gruppi() {
     m.get(k).varianti.push(c);
   }
   const lista = [...m.values()];
-  for (const g of lista) g.peso = Math.min(...g.varianti.map((c) => PESO[stato(c).cls]));
-  lista.sort((a, b) => a.peso - b.peso || a.k.localeCompare(b.k));
+  for (const g of lista) {
+    g.peso = Math.min(...g.varianti.map((c) => PESO[stato(c).cls]));
+    const vv = g.varianti.map(info).filter(Boolean);
+    g.sconto = Math.max(-1, ...vv.map((v) => (v.dettaglio && v.dettaglio.sconto != null ? v.dettaglio.sconto : -1)));
+    g.var7 = Math.min(Infinity, ...vv.map((v) => (v.var7 != null ? v.var7 : Infinity)));
+  }
+  const ordini = {
+    segnalazioni: (a, b) => a.peso - b.peso || a.k.localeCompare(b.k),
+    sconto: (a, b) => b.sconto - a.sconto || a.k.localeCompare(b.k),
+    calo: (a, b) => a.var7 - b.var7 || a.k.localeCompare(b.k),
+    nome: (a, b) => a.k.localeCompare(b.k),
+  };
+  lista.sort(ordini[S.ordine] || ordini.segnalazioni);
   return lista;
 }
 
@@ -224,6 +243,7 @@ function renderLista() {
             <div class="suggest" id="suggest" hidden></div>
           </div>
           <div class="filters" id="filters"></div>
+          <div id="ordina-riga"></div>
         </header>
         <main id="lista"></main>
       </div>`;
@@ -236,26 +256,35 @@ function renderLista() {
 
 function aggiornaLista() {
   const tutti = gruppi();
-  const nOcc = tutti.filter((g) => g.peso === 0).length;
-  const nBassi = tutti.filter((g) => g.varianti.some((c) => stato(c).cls === "gold")).length;
-  const filtri = [["tutte", `Tutte (${tutti.length})`], ["occasioni", `Occasioni (${nOcc})`], ["bassi", `Prezzi bassi (${nBassi})`]];
-  $("#filters").innerHTML = filtri.map(([k, t]) => `<button data-f="${k}" aria-pressed="${S.filtro === k}">${t}</button>`).join("");
+  const filtriDef = {
+    occasioni: (g) => ha(g, ["obiettivo", "occasione"]),
+    bassi: (g) => ha(g, ["basso"]),
+    rialzo: (g) => ha(g, ["rialzo"]),
+  };
+  const filtri = [["tutte", "Tutte", tutti.length], ["occasioni", "Occasioni", tutti.filter(filtriDef.occasioni).length],
+    ["bassi", "Prezzi bassi", tutti.filter(filtriDef.bassi).length], ["rialzo", "In rialzo", tutti.filter(filtriDef.rialzo).length]];
+  $("#filters").innerHTML = filtri.map(([k, t, n]) => `<button data-f="${k}" aria-pressed="${S.filtro === k}">${t} (${n})</button>`).join("") +
+    "";
+  $("#ordina-riga").innerHTML = `<label class="ordina"><span>Ordina per</span><select id="ordina">
+      ${[["segnalazioni", "segnalazioni"], ["sconto", "sconto sulle offerte"], ["calo", "calo in 7 giorni"], ["nome", "nome"]]
+        .map(([k, t]) => `<option value="${k}"${S.ordine === k ? " selected" : ""}>${t}</option>`).join("")}
+    </select></label>`;
   $("#filters").onclick = (e) => {
     const b = e.target.closest("button[data-f]");
     if (b) { S.filtro = b.dataset.f; aggiornaLista(); }
   };
+  $("#ordina").onchange = (e) => { S.ordine = e.target.value; scriviLocale("ordine", S.ordine); aggiornaLista(); };
 
   $("#fresh").textContent = S.dati.generato ? `Prezzi aggiornati ${tempoFa(S.dati.generato)}` : "Nessun controllo prezzi ancora disponibile";
 
-  let lista = tutti;
-  if (S.filtro === "occasioni") lista = tutti.filter((g) => g.peso === 0);
-  if (S.filtro === "bassi") lista = tutti.filter((g) => g.varianti.some((c) => stato(c).cls === "gold"));
+  const lista = filtriDef[S.filtro] ? tutti.filter(filtriDef[S.filtro]) : tutti;
 
   const main = $("#lista");
-  const banner = bannerNotifiche();
+  const banner = bannerStato() + bannerNotifiche();
   main.onclick = (e) => {
     if (e.target.closest("#b-attiva")) return attivaDaBanner();
     if (e.target.closest("#b-dopo")) { scriviLocale("banner-notifiche", "no"); return aggiornaLista(); }
+    if (e.target.closest("#b-stato")) return apriStato();
     const r = e.target.closest(".card-row");
     if (r) location.hash = "c/" + encodeURIComponent(r.dataset.k);
   };
@@ -278,6 +307,7 @@ function aggiornaLista() {
             <span class="gem ${st.cls}"></span>
             <span class="lbl">${esc(etichetta(c))}</span>
             ${v && v.serie && v.serie.length > 1 ? sparkline(v.serie) : ""}
+            ${v && v.var7 != null && Math.abs(v.var7) >= 1 ? `<span class="var num" title="Variazione in 7 giorni">${v.var7 < 0 ? "▼" : "▲"}${Math.abs(Math.round(v.var7))}%</span>` : ""}
             <span class="price num">${v && v.prezzo != null ? eur(v.prezzo) : "—"}</span>
           </div>`;
         }).join("")}
@@ -285,16 +315,36 @@ function aggiornaLista() {
     </button>`).join("");
 }
 
+function bannerStato() {
+  const m = S.dati.meta || {};
+  if (m.errore_globale) {
+    return `<div class="banner allarme"><p>${esc(m.errore_globale)}</p><button class="btn" id="b-stato">Stato del sistema</button></div>`;
+  }
+  if (S.dati.generato && Date.now() - Date.parse(S.dati.generato) > 2 * 3600000) {
+    return `<div class="banner allarme"><p>Gli ultimi prezzi sono di ${esc(tempoFa(S.dati.generato))}: il controllo automatico potrebbe essersi fermato.</p><button class="btn" id="b-stato">Stato del sistema</button></div>`;
+  }
+  return "";
+}
+
+/* Scala verticale minima: almeno ±5% attorno al prezzo, così variazioni di
+   pochi centesimi restano piatte invece di riempire tutto il grafico. */
+function scalaMinima(ymin, ymax) {
+  const centro = (ymin + ymax) / 2;
+  const meta = Math.max((ymax - ymin) / 2, centro * 0.05, 0.01);
+  return [centro - meta, centro + meta];
+}
+
 function sparkline(serie) {
   const ultimo = serie[serie.length - 1][0];
   const pts = serie.filter((p) => p[0] >= ultimo - 7 * 86400);
   if (pts.length < 2) return "";
   const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
-  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  const [y0, y1] = scalaMinima(Math.min(...ys), Math.max(...ys));
   const W = 56, H = 20;
   const d = pts.map((p) => {
     const x = x1 === x0 ? 0 : ((p[0] - x0) / (x1 - x0)) * W;
-    const y = y1 === y0 ? H / 2 : H - 2 - ((p[1] - y0) / (y1 - y0)) * (H - 4);
+    const y = H - 2 - ((p[1] - y0) / (y1 - y0)) * (H - 4);
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(" ");
   return `<svg class="spark" viewBox="0 0 ${W} ${H}" aria-hidden="true"><polyline points="${d}" fill="none" stroke="#93ADA6" stroke-width="1.5"/></svg>`;
@@ -370,14 +420,21 @@ function renderDettaglio(k) {
 function listaOfferte(d) {
   const offerte = d.offerte || [];
   if (!offerte.length) return "";
-  return `<details class="offerte"><summary>Le ${offerte.length} offerte usate per il confronto</summary>
+  return `<details class="offerte"><summary>Le ${offerte.length} offerte più economiche</summary>
     <ol>${offerte.map((o, i) => `
-      <li${i === 0 ? ' class="prima"' : ""}>
+      <li class="${i === 0 ? "prima" : ""}${o.esclusa ? " esclusa" : ""}">
         <span class="num">${eur(o.prezzo)}</span>
         <span>${esc([o.condizione, o.lingua ? o.lingua.toUpperCase() : "", o.foil ? "foil" : "non foil", o.espansione].filter(Boolean).join(", "))}
-          <small>${esc(o.venditore || "?")}${o.quantita ? `, ${o.quantita} disp.` : ""}</small></span>
+          <small>${esc(o.venditore || "?")}${o.quantita ? `, ${o.quantita} disp.` : ""}${o.esclusa ? "<br>Esclusa dalla media perché fuori scala" : ""}</small></span>
       </li>`).join("")}
     </ol></details>`;
+}
+
+/* "8% sotto" / "3% sopra" / "in linea" */
+function confronto(a, b) {
+  if (!b) return "";
+  const d = Math.round((100 * (a - b)) / b);
+  return d === 0 ? "in linea" : `${Math.abs(d)}% ${d < 0 ? "sotto" : "sopra"}`;
 }
 
 function sezioneVariante(c) {
@@ -385,6 +442,8 @@ function sezioneVariante(c) {
   const st = stato(c);
   const d = v.dettaglio || {};
   const sp = c.percentile_soglia || DEF_PERCENTILE, so = c.soglia_occasione || DEF_OCCASIONE, sr = c.soglia_ribasso || DEF_RIBASSO;
+  const sri = c.soglia_rialzo !== undefined && c.soglia_rialzo !== "" ? c.soglia_rialzo : DEF_RIALZO;
+  const sg = segnali(c);
   const edizioni = [
     c.edizioni_incluse ? `solo ${c.edizioni_incluse}` : "",
     c.edizioni_escluse ? `escluse ${c.edizioni_escluse}` : "",
@@ -403,12 +462,18 @@ function sezioneVariante(c) {
       <h3><span class="gem ${st.cls}"></span>${esc(etichetta(c))}<span class="sp"></span>
         ${v.ultimo_controllo ? `<small>${esc(tempoFa(v.ultimo_controllo))}</small>` : ""}</h3>
       <div class="big num">${eur(v.prezzo)}</div>
-      ${st.testo ? `<p class="status ${st.cls}">${esc(st.testo)}</p>` : ""}
+      ${(sg.length ? sg : st.testo ? [st] : []).map((x) => `<p class="status ${x.cls}">${esc(x.testo)}</p>`).join("")}
       ${v.prezzo != null ? `
         <div class="stats num">
           <div><small>Minimo</small><b>${eur(v.min)}</b></div>
           <div><small>Medio</small><b>${eur(v.media)}</b></div>
           <div><small>Massimo</small><b>${eur(v.max)}</b></div>
+        </div>
+        <div class="stats due num">
+          <div><small>Tutti i venditori</small><b>${eur(v.minimo_assoluto)}</b>
+            ${d.assoluto && d.assoluto.venditore ? `<small>${esc(d.assoluto.venditore)}, ${d.assoluto.ct_zero ? "con" : "senza"} CardTrader Zero</small>` : ""}</div>
+          <div><small>Cardmarket</small><b>${v.cm ? eur(v.cm.prezzo) : "—"}</b>
+            ${v.cm ? `<small>${esc(v.cm.set || "")}${v.prezzo ? `, CardTrader ${confronto(v.prezzo, v.cm.prezzo)}` : ""}</small>` : `<small>non disponibile</small>`}</div>
         </div>` : ""}
       ${percentileTesto}
       ${v.serie && v.serie.length ? `
@@ -422,11 +487,12 @@ function sezioneVariante(c) {
           <p><b>Offerta migliore: ${eur(d.prezzo)}</b></p>
           <p class="muted">${esc([d.condizione, d.lingua ? d.lingua.toUpperCase() : "", d.foil ? "foil" : "non foil", d.espansione].filter(Boolean).join(", "))}</p>
           <p class="muted">Venditore ${esc(d.venditore || "?")}${d.quantita ? `, ${d.quantita} disponibili` : ""}</p>
-          ${d.media20 != null ? `<p class="muted">Media delle ${d.n_riferimento || Math.min(10, d.offerte_valide || 10)} offerte più economiche: ${eur(d.media20)} (minimo ${Math.round(d.sconto)}% sotto)</p>` : ""}
+          ${d.media20 != null ? `<p class="muted">Media delle ${d.n_riferimento || Math.min(10, d.offerte_valide || 10)} offerte più economiche: ${eur(d.media20)} (minimo ${Math.round(d.sconto)}% sotto)${
+            d.escluse ? `. ${d.escluse === 1 ? "Esclusa 1 offerta fuori scala" : `Escluse ${d.escluse} offerte fuori scala`}, sopra ${eur(d.limite_fuori_scala)}` : ""}</p>` : ""}
           ${listaOfferte(d)}
           ${d.link ? `<a class="btn primary block" href="${esc(d.link)}" target="_blank" rel="noopener">Apri su CardTrader</a>` : ""}
         </div>` : ""}
-      <p class="settings-line">Avvisi: prezzo basso se sotto il ${esc(sp)}° percentile e almeno ${esc(sr)}% sotto la mediana storica; occasione da ${esc(so)}% di sconto. Edizioni: ${esc(edizioni)}.</p>
+      <p class="settings-line">Avvisi: ${c.prezzo_obiettivo ? `obiettivo ${esc(eur(Number(c.prezzo_obiettivo)))}; ` : ""}prezzo basso se sotto il ${esc(sp)}° percentile e almeno ${esc(sr)}% sotto la mediana storica; occasione da ${esc(so)}% di sconto; rialzo ${Number(sri) > 0 ? `da +${esc(sri)}%` : "disattivato"}. Edizioni: ${esc(edizioni)}.</p>
       <div class="row-btns">
         <button class="btn" data-edit="${esc(c.id)}">Modifica</button>
         <button class="btn danger" data-del="${esc(c.id)}">Rimuovi</button>
@@ -447,7 +513,9 @@ function disegnaGrafico(c) {
     ranges.querySelectorAll("button").forEach((x) => x.setAttribute("aria-pressed", x === b));
     disegnaGrafico(c);
   };
-  const serie = (info(c) || {}).serie || [];
+  const v = info(c) || {};
+  const serie = v.serie || [];
+  const fonti = v.fonti || [];
   const giorni = Number(S.range[c.id] || "30");
   const fine = serie.length ? serie[serie.length - 1][0] : 0;
   const pts = giorni ? serie.filter((p) => p[0] >= fine - giorni * 86400) : serie;
@@ -455,17 +523,34 @@ function disegnaGrafico(c) {
     box.innerHTML = `<p class="settings-line">Servono almeno due rilevazioni in questo periodo per disegnare il grafico.</p>`;
     return;
   }
-  const W = Math.max(box.clientWidth, 280), H = 190;
-  const L = 4, R = 54, T = 26, B = 22;
-  const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
-  const x0 = Math.min(...xs), x1 = Math.max(...xs);
-  let y0 = Math.min(...ys), y1 = Math.max(...ys);
-  if (y1 - y0 < 0.02) { y0 -= 0.5; y1 += 0.5; }
+  const x0 = pts[0][0], x1 = pts[pts.length - 1][0];
+
+  // Cardmarket: prezzo "a gradini" (cambia al massimo una volta al giorno)
+  const cmTutti = v.cm_serie || [];
+  const cmPrima = cmTutti.filter((p) => p[0] <= x0).pop();
+  const cm = [...(cmPrima ? [[x0, cmPrima[1]]] : []), ...cmTutti.filter((p) => p[0] > x0 && p[0] <= x1)];
+  if (cm.length) cm.push([x1, cm[cm.length - 1][1]]);
+  const cmAl = (t) => { const q = cmTutti.filter((p) => p[0] <= t).pop(); return q ? q[1] : null; };
+  // minimo assoluto (anche venditori senza CardTrader Zero)
+  const ass = pts.filter((p) => p[3] != null);
+
+  const W = Math.max(box.clientWidth, 280), H = 200;
+  const L = 4, R = 54, T = 30, B = 22;
+  const valori = [...pts.map((p) => p[1]), ...ass.map((p) => p[3]), ...cm.map((p) => p[1])];
+  let [y0, y1] = scalaMinima(Math.min(...valori), Math.max(...valori));
   const pad = (y1 - y0) * 0.08; y0 -= pad; y1 += pad;
   const X = (t) => L + ((t - x0) / (x1 - x0 || 1)) * (W - L - R);
   const Y = (p) => T + (1 - (p - y0) / (y1 - y0)) * (H - T - B);
   const linea = pts.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join("");
   const area = `${linea}L${X(x1).toFixed(1)},${H - B}L${X(x0).toFixed(1)},${H - B}Z`;
+  let lineaAss = "", prec = false;
+  for (const p of pts) {
+    if (p[3] == null) { prec = false; continue; }
+    lineaAss += `${prec ? "L" : "M"}${X(p[0]).toFixed(1)},${Y(p[3]).toFixed(1)}`;
+    prec = true;
+  }
+  const lineaCm = cm.map((p, i) => (i ? `H${X(p[0]).toFixed(1)}V${Y(p[1]).toFixed(1)}` : `M${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`)).join("");
+  const ys = pts.map((p) => p[1]);
   const iMin = ys.indexOf(Math.min(...ys));
   const ticks = [y0 + pad, (y0 + y1) / 2, y1 - pad];
   const giorno = (t) => new Date(t * 1000).toLocaleDateString("it-IT", { day: "2-digit", month: "2-digit" });
@@ -474,19 +559,26 @@ function disegnaGrafico(c) {
       <defs><linearGradient id="g-${esc(c.id)}" x1="0" y1="0" x2="0" y2="1">
         <stop offset="0" stop-color="#B7C4C9" stop-opacity=".22"/><stop offset="1" stop-color="#B7C4C9" stop-opacity="0"/>
       </linearGradient></defs>
-      ${ticks.map((v) => `<line x1="${L}" x2="${W - R}" y1="${Y(v)}" y2="${Y(v)}" stroke="#1D4740"/>
-        <text x="${W - R + 6}" y="${Y(v) + 4}" fill="#93ADA6" font-size="12" class="num">${eur(v)}</text>`).join("")}
+      ${ticks.map((t) => `<line x1="${L}" x2="${W - R}" y1="${Y(t)}" y2="${Y(t)}" stroke="#1D4740"/>
+        <text x="${W - R + 6}" y="${Y(t) + 4}" fill="#93ADA6" font-size="12" class="num">${eur(t)}</text>`).join("")}
       <path d="${area}" fill="url(#g-${esc(c.id)})"/>
+      ${lineaCm ? `<path d="${lineaCm}" fill="none" stroke="#7DB8E8" stroke-width="1.6"/>` : ""}
+      ${lineaAss ? `<path d="${lineaAss}" fill="none" stroke="#93ADA6" stroke-width="1.4" stroke-dasharray="4 3"/>` : ""}
       <path d="${linea}" fill="none" stroke="#EAF2EE" stroke-width="1.8" stroke-linejoin="round"/>
       <circle cx="${X(pts[iMin][0])}" cy="${Y(pts[iMin][1])}" r="4" fill="#E3B94F"/>
       <text x="${L}" y="${H - 5}" fill="#93ADA6" font-size="12">${giorno(x0)}</text>
       <text x="${W - R}" y="${H - 5}" fill="#93ADA6" font-size="12" text-anchor="end">${giorno(x1)}</text>
-      <g id="cur-${esc(c.id)}" visibility="hidden">
+      <g visibility="hidden">
         <line y1="${T - 4}" y2="${H - B}" stroke="#93ADA6" stroke-dasharray="3 3"/>
         <circle r="4.5" fill="#EAF2EE"/>
       </g>
     </svg>
-    <div class="tip" hidden></div>`;
+    <div class="tip" hidden></div>
+    <div class="legenda">
+      <span><i class="l-zero"></i>CardTrader Zero</span>
+      ${lineaAss ? `<span><i class="l-ass"></i>Tutti i venditori</span>` : ""}
+      ${lineaCm ? `<span><i class="l-cm"></i>Cardmarket</span>` : ""}
+    </div>`;
   const svg = box.querySelector("svg"), cur = box.querySelector("g"), tip = box.querySelector(".tip");
   const mostra = (ev) => {
     const rect = svg.getBoundingClientRect();
@@ -499,10 +591,17 @@ function disegnaGrafico(c) {
     cur.querySelector("line").setAttribute("x2", px);
     cur.querySelector("circle").setAttribute("cx", px);
     cur.querySelector("circle").setAttribute("cy", py);
+    const fonte = p[2] != null && fonti[p[2]] ? fonti[p[2]] : null;
+    const cmv = cmAl(p[0]);
+    const righe = [
+      fonte ? esc([fonte[0], fonte[1]].filter(Boolean).join(", ")) : "",
+      p[3] != null && p[3] < p[1] - 0.004 ? `Tutti i venditori: ${esc(eur(p[3]))}` : "",
+      cmv != null ? `Cardmarket: ${esc(eur(cmv))}` : "",
+    ].filter(Boolean);
     tip.hidden = false;
-    tip.textContent = `${eur(p[1])}, ${dataOra(p[0])}`;
+    tip.innerHTML = `${esc(eur(p[1]))}, ${esc(dataOra(p[0]))}` + righe.map((r) => `<small>${r}</small>`).join("");
     const left = (px / W) * rect.width;
-    tip.style.left = Math.min(Math.max(left, 80), rect.width - 80) + "px";
+    tip.style.left = Math.min(Math.max(left, 95), rect.width - 95) + "px";
   };
   svg.addEventListener("pointerdown", mostra);
   svg.addEventListener("pointermove", (e) => { if (e.pointerType === "mouse" || e.buttons) mostra(e); });
@@ -524,6 +623,7 @@ function apriMenu() {
     <div class="menu-list" style="margin-top:14px">
       <button class="btn" id="m-check">Aggiorna prezzi ora</button>
       <button class="btn" id="m-notifiche">Notifiche</button>
+      <button class="btn" id="m-stato">Stato del sistema</button>
       <button class="btn" id="m-import">Importa dal foglio Google</button>
       <button class="btn danger" id="m-exit">Esci</button>
     </div>`);
@@ -531,6 +631,7 @@ function apriMenu() {
   $("#m-import", p).onclick = apriImporta;
   $("#m-exit", p).onclick = () => esci("");
   $("#m-notifiche", p).onclick = apriNotifiche;
+  $("#m-stato", p).onclick = apriStato;
 }
 
 function apriImporta() {
@@ -571,6 +672,8 @@ function apriModulo(c) {
     percentile_soglia: c.percentile_soglia || "",
     soglia_occasione: c.soglia_occasione || "",
     soglia_ribasso: c.soglia_ribasso || "",
+    soglia_rialzo: c.soglia_rialzo ?? "",
+    prezzo_obiettivo: c.prezzo_obiettivo || "",
     incl: new Set(), escl: new Set(),
     extraIncl: c.edizioni_incluse || "", extraEscl: c.edizioni_escluse || "",
   };
@@ -597,6 +700,14 @@ function apriModulo(c) {
         </div>
         <div class="help">Codici, nomi o link delle pagine edizione di CardTrader, separati da punto e virgola.</div>
       </details>
+    </div>
+    <div class="field two">
+      <div><label for="s-obi">Prezzo obiettivo (€)</label>
+        <input class="input num" id="s-obi" inputmode="decimal" placeholder="nessuno" value="${esc(String(f.prezzo_obiettivo).replace(".", ","))}">
+        <div class="help">Avvisa quando il prezzo scende fino a questo valore.</div></div>
+      <div><label for="s-ria">Avviso rialzo (%)</label>
+        <input class="input num" id="s-ria" inputmode="numeric" placeholder="${DEF_RIALZO}" value="${esc(f.soglia_rialzo)}">
+        <div class="help">Avvisa se sale di questo % rispetto ai 3 giorni prima. 0 = mai.</div></div>
     </div>
     <div class="field"><span class="lab">Avviso prezzo basso</span>
       <div class="two">
@@ -682,6 +793,8 @@ async function salvaModulo(f, p, nuovo) {
     percentile_soglia: numero($("#s-perc", p).value),
     soglia_occasione: numero($("#s-occ", p).value),
     soglia_ribasso: numero($("#s-rib", p).value),
+    soglia_rialzo: numero($("#s-ria", p).value),
+    prezzo_obiettivo: numero($("#s-obi", p).value.replace("€", "")),
     edizioni_incluse: incl.join("; "),
     edizioni_escluse: escl.join("; "),
   };
@@ -718,6 +831,70 @@ async function rimuovi(id) {
   } catch (e) {
     toast("Rimozione non riuscita: " + e.message);
   }
+}
+
+/* ------------------------------------------------------------------ stato del sistema */
+
+/* GitHub scrive la scadenza come "2026-12-31 23:59:59 UTC" o "... +0100" */
+function dataGitHub(s) {
+  if (!s) return null;
+  const m = String(s).replace(" UTC", " +0000").match(/^(\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d) ([+-]\d\d)(\d\d)$/);
+  const t = m ? Date.parse(`${m[1]}T${m[2]}${m[3]}:${m[4]}`) : Date.parse(s);
+  return Number.isNaN(t) ? null : t;
+}
+
+function rigaToken(nome, info, scadenza) {
+  if (info && !info.ok && info.codice !== 404) {
+    return `<li class="warn"><b>${esc(nome)}</b>: GitHub lo rifiuta (errore ${esc(info.codice)}). Controlla il token e i suoi permessi.</li>`;
+  }
+  if (!scadenza) return `<li><b>${esc(nome)}</b>: valido${info && info.codice === 404 ? " (file dei dati non ancora creato)" : ""}, nessuna scadenza indicata.</li>`;
+  const giorni = Math.floor((scadenza - Date.now()) / 86400000);
+  const quando = new Date(scadenza).toLocaleDateString("it-IT");
+  if (giorni < 0) return `<li class="warn"><b>${esc(nome)}</b>: scaduto il ${quando}. Va rigenerato.</li>`;
+  return `<li class="${giorni < 14 ? "warn" : ""}"><b>${esc(nome)}</b>: scade il ${quando} (tra ${giorni} ${giorni === 1 ? "giorno" : "giorni"}).</li>`;
+}
+
+async function apriStato() {
+  const p = apriPannello(`<h2>Stato del sistema</h2><div id="st-corpo"><p class="settings-line">Controllo…</p></div>
+    <div class="sheet-actions"><button class="btn" id="st-chiudi">Chiudi</button></div>`);
+  $("#st-chiudi", p).onclick = chiudiPannello;
+  let st = {};
+  try { st = await api("/api/stato"); } catch (e) { st = { errore: e.message }; }
+  if (!document.body.contains(p)) return;
+  const m = S.dati.meta || {};
+  const vecchi = S.dati.generato && Date.now() - Date.parse(S.dati.generato) > 2 * 3600000;
+  const durata = m.durata_s != null ? `, durata ${Math.floor(m.durata_s / 60)} min ${m.durata_s % 60} s` : "";
+  const ESITI = { success: "riuscito", failure: "fallito", cancelled: "annullato", timed_out: "scaduto", skipped: "saltato" };
+  const esecuzioni = (st.esecuzioni || []).map((x) => {
+    const esito = x.stato !== "completed" ? (x.stato === "queued" ? "in coda" : "in corso") : ESITI[x.esito] || x.esito;
+    const cls = x.esito === "failure" ? "warn" : "";
+    return `<li class="${cls}">${x.esito === "success" ? "✓" : x.stato !== "completed" ? "…" : "✗"} ${esc(tempoFa(x.inizio))}: ${esc(esito)}</li>`;
+  }).join("");
+  const problemi = S.carte.map((c) => ({ c, v: info(c) })).filter(({ v }) => v && v.fallimenti)
+    .map(({ c, v }) => `<li class="warn"><b>${esc(nomeVisibile(c.nome_carta))}</b> (${esc(etichetta(c))}): ${esc(v.ultimo_errore || "errore")}, ${v.fallimenti} controlli di fila</li>`).join("");
+  const tk = st.token || {};
+  $("#st-corpo", p).innerHTML = `
+    ${m.errore_globale ? `<div class="banner allarme"><p>${esc(m.errore_globale)}</p></div>` : ""}
+    <div class="field"><span class="lab">Controllo prezzi</span>
+      <ul class="elenco">
+        <li class="${vecchi ? "warn" : ""}">Ultimo aggiornamento dei dati: ${S.dati.generato ? esc(tempoFa(S.dati.generato)) : "mai"}${m.n_carte != null ? ` (${m.n_carte} varianti${durata})` : ""}.
+          ${vecchi ? "Più vecchio del previsto: controlla cron-job.org e la scheda Actions su GitHub." : ""}</li>
+      </ul></div>
+    <div class="field"><span class="lab">Ultime esecuzioni</span>
+      ${st.errore ? `<p class="settings-line">Non disponibili: ${esc(st.errore)}</p>` : esecuzioni ? `<ul class="elenco">${esecuzioni}</ul>` : `<p class="settings-line">Nessuna esecuzione trovata.</p>`}
+    </div>
+    <div class="field"><span class="lab">Carte con problemi</span>
+      ${problemi ? `<ul class="elenco">${problemi}</ul>` : `<p class="settings-line">Nessuna.</p>`}
+    </div>
+    <div class="field"><span class="lab">Token</span>
+      <ul class="elenco">
+        ${m.cardtrader_scadenza !== undefined ? rigaToken("CardTrader", m.errore_globale ? { ok: false, codice: 403 } : { ok: true }, m.cardtrader_scadenza ? Date.parse(m.cardtrader_scadenza) : null) : ""}
+        ${tk.dati ? rigaToken(`GitHub, lettura dati (${tk.dati.nome})`, tk.dati, dataGitHub(tk.dati.scadenza)) : ""}
+        ${tk.azioni ? rigaToken("GitHub, avvio controlli (GITHUB_TOKEN)", tk.azioni, dataGitHub(tk.azioni.scadenza)) : ""}
+      </ul></div>
+    <div class="field"><span class="lab">Notifiche</span>
+      <p class="settings-line">${st.telefoni != null ? `${st.telefoni} ${st.telefoni === 1 ? "telefono registrato" : "telefoni registrati"}.` : "—"}</p>
+    </div>`;
 }
 
 /* ------------------------------------------------------------------ notifiche */

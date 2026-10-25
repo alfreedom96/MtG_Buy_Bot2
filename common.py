@@ -31,7 +31,11 @@ MINIMO_PUNTI_PER_STATISTICA = 5
 MAX_PUNTI_STORICO = 5000  # circa 70 giorni con un controllo ogni 20 minuti
 SOGLIA_FALLIMENTI_CONSECUTIVI = 10  # dopo quanti fallimenti di fila avvisare
 N_OFFERTE_RIFERIMENTO = 10  # occasione: confronto con la media delle N offerte più economiche
-SOGLIA_RIBASSO_PREDEFINITA = 5.0  # "prezzo basso": almeno questo % sotto la mediana storica
+FATTORE_FUORI_SCALA = 1.5  # occasione: escluse le offerte oltre 1,5 volte la mediana delle 10 più economiche
+SOGLIA_RIBASSO_PREDEFINITA = 5.0
+SOGLIA_RIALZO_PREDEFINITA = 15.0  # avviso impennata: +15% ...
+GIORNI_RIALZO = 3                 # ... rispetto ai 3 giorni precedenti
+ORE_LIVELLO_ATTUALE = 6           # livello attuale = mediana delle ultime 6 ore  # "prezzo basso": almeno questo % sotto la mediana storica
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +112,8 @@ def _normalizza_riga(row):
         "foil": foil,
         "percentile_soglia": row.get("percentile_soglia") or "",
         "soglia_ribasso": (row.get("soglia_ribasso") or "").replace("%", "").replace(",", ".").strip(),
+        "soglia_rialzo": (row.get("soglia_rialzo") or "").replace("%", "").replace(",", ".").strip(),
+        "prezzo_obiettivo": (row.get("prezzo_obiettivo") or "").replace("€", "").replace(",", ".").strip(),
         "soglia_occasione": (row.get("soglia_occasione") or "").replace("%", "").replace(",", ".").strip(),
         "edizioni_escluse": _lista_edizioni(row.get("edizioni_escluse")),
         "edizioni_incluse": _lista_edizioni(row.get("edizioni_incluse")),
@@ -367,11 +373,15 @@ def stampe_scryfall(nome_carta):
     return []
 
 
-def trova_blueprint_ids(ct_client, nome_carta, escluse=None, incluse=None):
+def trova_blueprint_ids(ct_client, nome_carta, escluse=None, incluse=None, cache=None):
     """Trova tutti i blueprint_id di CardTrader corrispondenti a tutte le
     edizioni della carta, incrociando Scryfall (per sapere in quali set
-    è stata stampata) con l'elenco espansioni/blueprint di CardTrader."""
-    set_codes = stampe_scryfall(nome_carta)
+    è stata stampata) con l'elenco espansioni/blueprint di CardTrader.
+    Con `cache` (mercato.CacheCarte) usa i risultati memorizzati."""
+    if cache is not None:
+        set_codes = [s["set"] for s in cache.stampe(nome_carta)[0]]
+    else:
+        set_codes = stampe_scryfall(nome_carta)
     espansioni = ct_client.espansioni_magic()
     blueprint_ids = set()
     nome_lower = pulisci_nome(nome_carta).lower()
@@ -402,6 +412,9 @@ def trova_blueprint_ids(ct_client, nome_carta, escluse=None, incluse=None):
         expansion_ids_da_controllare.add(espansioni[code])
 
     for expansion_id in expansion_ids_da_controllare:
+        if cache is not None:
+            blueprint_ids.update(cache.blueprint(ct_client, nome_carta, expansion_id))
+            continue
         try:
             blueprints = ct_client.blueprints_per_espansione(expansion_id)
         except requests.HTTPError:
@@ -448,14 +461,14 @@ def link_pagina_carta(nome_carta, nome_espansione):
     return f"https://www.cardtrader.com/en/cards/{slug}"
 
 
-def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escluse=None, incluse=None):
+def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escluse=None, incluse=None, cache=None):
     """Cerca il prezzo più basso che rispetta i filtri (condizione Mint/NM/SP,
     CardTrader Zero). Ritorna (risultato, errore):
       - risultato = (prezzo, dettagli, numero_offerte_valide) se trovato
       - errore = messaggio testuale se non trovato (che include, quando
         possibile, informazioni sul mercato anche fuori dai filtri richiesti,
         solo a scopo informativo)."""
-    blueprint_ids = trova_blueprint_ids(ct_client, nome_carta, escluse, incluse)
+    blueprint_ids = trova_blueprint_ids(ct_client, nome_carta, escluse, incluse, cache)
     if not blueprint_ids:
         return None, "nessuna edizione trovata su CardTrader (o tutte escluse dai filtri edizione)"
 
@@ -468,6 +481,7 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
     offerte_valide = []  # dettagli di ogni offerta valida, per mostrarle nell'app
     # per il messaggio informativo se non troviamo nulla nelle condizioni richieste
     miglior_altre_condizioni = None
+    minimo_assoluto = None  # anche venditori senza CardTrader Zero (solo per il grafico)
 
     for blueprint_id in blueprint_ids:
         for lingua in lingue:
@@ -480,10 +494,9 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
 
                 for p in prodotti:
                     user = p.get("user", {})
-                    if not user.get("can_sell_via_hub"):
-                        continue  # richiesto CardTrader Zero
                     if user.get("on_vacation"):
                         continue
+                    ct_zero = bool(user.get("can_sell_via_hub"))
 
                     exp = p.get("expansion") or {}
                     exp_ids = {x for x in (_norm_edizione(exp.get("code") or ""),
@@ -510,9 +523,21 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
 
                     if condizione not in CONDIZIONI_ACCETTATE:
                         # non valido per l'acquisto, ma lo teniamo per l'informazione
-                        if miglior_altre_condizioni is None or prezzo < miglior_altre_condizioni[0]:
+                        if ct_zero and (miglior_altre_condizioni is None or prezzo < miglior_altre_condizioni[0]):
                             miglior_altre_condizioni = (prezzo, condizione)
                         continue
+
+                    # minimo assoluto: tutti i venditori, con o senza CardTrader Zero
+                    if minimo_assoluto is None or prezzo < minimo_assoluto["prezzo"]:
+                        minimo_assoluto = {
+                            "prezzo": prezzo,
+                            "venditore": user.get("username"),
+                            "espansione": exp.get("name_en"),
+                            "ct_zero": ct_zero,
+                        }
+
+                    if not ct_zero:
+                        continue  # per acquisto e avvisi serve CardTrader Zero
 
                     numero_offerte_valide += 1
                     prezzi_validi.append(prezzo)
@@ -550,6 +575,7 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
             )
         return None, "nessuna offerta trovata con i filtri richiesti (mercato vuoto)"
 
+    miglior[1]["minimo_assoluto"] = minimo_assoluto
     miglior[1]["prezzi_offerte"] = sorted(prezzi_validi)
     miglior[1]["offerte_riferimento"] = sorted(offerte_valide, key=lambda o: o["prezzo"])[:N_OFFERTE_RIFERIMENTO]
     return (miglior[0], miglior[1], numero_offerte_valide), None
@@ -572,18 +598,38 @@ def valuta_prezzo_basso(prezzi_passati, prezzo, soglia_percentile, soglia_ribass
     return percentile, mediana, ribasso, percentile <= soglia_percentile and ribasso >= soglia_ribasso
 
 
-def analizza_occasione(prezzi_offerte, soglia_pct, n_riferimento=N_OFFERTE_RIFERIMENTO, minimo_offerte=5):
+def analizza_occasione(prezzi_offerte, soglia_pct, n_riferimento=N_OFFERTE_RIFERIMENTO,
+                       minimo_offerte=5, fattore_fuori_scala=FATTORE_FUORI_SCALA):
     """Confronta l'offerta più economica con la media delle (fino a) 10 offerte
-    più economiche (minimo incluso). Ritorna (media, sconto_pct, e_occasione)
+    più economiche (minimo incluso).
+
+    Le offerte "fuori scala" verso l'alto (oltre 1,5 volte la mediana di quelle
+    10, es. una foil a 99 € tra offerte da 47 €) vengono escluse dalla media,
+    perché la gonfierebbero facendo sembrare un'occasione un prezzo normale.
+    Le offerte troppo basse invece restano: sono proprio le occasioni.
+
+    Ritorna un dizionario (media, sconto, occasione, usate, escluse, limite)
     oppure None se le offerte sono troppo poche per un confronto sensato."""
+    import statistics
     if len(prezzi_offerte) < minimo_offerte:
         return None
     migliori = sorted(prezzi_offerte)[:n_riferimento]
-    media = sum(migliori) / len(migliori)
+    limite = statistics.median(migliori) * fattore_fuori_scala
+    usate = [p for p in migliori if p <= limite]
+    if len(usate) < minimo_offerte:
+        return None
+    media = sum(usate) / len(usate)
     if media <= 0:
         return None
-    sconto = 100 * (media - migliori[0]) / media
-    return media, sconto, sconto >= soglia_pct
+    sconto = 100 * (media - usate[0]) / media
+    return {
+        "media": media,
+        "sconto": sconto,
+        "occasione": sconto >= soglia_pct,
+        "usate": len(usate),
+        "escluse": len(migliori) - len(usate),
+        "limite": limite,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -618,55 +664,136 @@ def calcola_tendenza(ultimi_prezzi):
 # Dati per l'app (versione compatta dello storico)
 # ---------------------------------------------------------------------------
 
+def _ts(data):
+    """'2026-10-24T10:00:00Z' -> secondi dal 1970 (None se non valida)"""
+    from datetime import datetime, timezone
+    try:
+        return int(datetime.strptime(data, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
+def valuta_rialzo(rilevazioni, soglia_pct, giorni=GIORNI_RIALZO, ore_recenti=ORE_LIVELLO_ATTUALE):
+    """Impennata: il livello attuale (mediana delle ultime 6 ore, così
+    un'offerta che compare e scompare non conta) confrontato con la mediana
+    dei 3 giorni precedenti. Ritorna un dizionario oppure None se i dati non
+    coprono ancora abbastanza tempo."""
+    import statistics
+    punti = [(t, r["prezzo"]) for r in rilevazioni if (t := _ts(r.get("data"))) is not None]
+    if not punti:
+        return None
+    ora = punti[-1][0]
+    recenti = [p for t, p in punti if t >= ora - ore_recenti * 3600]
+    base = [p for t, p in punti if ora - giorni * 86400 <= t < ora - ore_recenti * 3600]
+    if len(recenti) < 3 or len(base) < 10:
+        return None
+    livello = statistics.median(recenti)
+    riferimento = statistics.median(base)
+    if riferimento <= 0:
+        return None
+    rialzo = 100 * (livello - riferimento) / riferimento
+    return {
+        "livello": livello,
+        "riferimento": riferimento,
+        "rialzo": rialzo,
+        "attivo": soglia_pct > 0 and rialzo >= soglia_pct,
+    }
+
+
+def variazione_7_giorni(rilevazioni):
+    """Variazione % del prezzo rispetto a 7 giorni fa (None se lo storico è più corto)."""
+    punti = [(t, r["prezzo"]) for r in rilevazioni if (t := _ts(r.get("data"))) is not None]
+    if len(punti) < 2:
+        return None
+    ora, prezzo = punti[-1]
+    vecchi = [p for t, p in punti if t <= ora - 7 * 86400]
+    if not vecchi or vecchi[-1] <= 0:
+        return None
+    return round(100 * (prezzo - vecchi[-1]) / vecchi[-1], 2)
+
+
 def _serie_compatta(rilevazioni, ore_dettaglio=48, ore_bucket=6):
     """Ultime 48 ore a piena risoluzione, prima un punto (il prezzo minimo)
-    ogni 6 ore. Ritorna [[epoch_secondi, prezzo], ...]."""
-    from datetime import datetime, timezone
+    ogni 6 ore. Ritorna (serie, fonti):
+      serie = [[epoch, prezzo, indice_fonte, minimo_assoluto], ...]; gli ultimi
+              due valori possono essere null (rilevazioni vecchie) o mancare
+      fonti = [[venditore, edizione], ...] senza ripetizioni, per tenere il
+              file piccolo."""
     punti = []
     for r in rilevazioni:
-        try:
-            t = int(datetime.strptime(r["data"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp())
-        except (KeyError, ValueError):
-            continue
-        punti.append((t, r["prezzo"]))
+        t = _ts(r.get("data"))
+        if t is not None:
+            punti.append((t, r["prezzo"], r.get("v"), r.get("e"), r.get("a")))
     if not punti:
-        return []
+        return [], []
     limite = punti[-1][0] - ore_dettaglio * 3600
     vecchi = {}
     recenti = []
-    for t, p in punti:
-        if t >= limite:
-            recenti.append([t, p])
+    for punto in punti:
+        if punto[0] >= limite:
+            recenti.append(punto)
         else:
-            bucket = t // (ore_bucket * 3600)
-            if bucket not in vecchi or p < vecchi[bucket][1]:
-                vecchi[bucket] = [t, p]
-    return [vecchi[k] for k in sorted(vecchi)] + recenti
+            bucket = punto[0] // (ore_bucket * 3600)
+            if bucket not in vecchi or punto[1] < vecchi[bucket][1]:
+                vecchi[bucket] = punto
+    scelti = [vecchi[k] for k in sorted(vecchi)] + recenti
+    fonti, indici, serie = [], {}, []
+    for t, p, venditore, edizione, assoluto in scelti:
+        k = None
+        if venditore or edizione:
+            chiave = (venditore or "", edizione or "")
+            if chiave not in indici:
+                indici[chiave] = len(fonti)
+                fonti.append(list(chiave))
+            k = indici[chiave]
+        punto = [t, p, k, assoluto]
+        while len(punto) > 2 and punto[-1] is None:
+            punto.pop()
+        serie.append(punto)
+    return serie, fonti
 
 
-def scrivi_dati_app(storico, righe, percentile_default, occasione_default, ribasso_default=SOGLIA_RIBASSO_PREDEFINITA):
+def _valore(riga, campo, predefinito):
+    try:
+        return float(riga[campo]) if riga.get(campo) else predefinito
+    except ValueError:
+        return predefinito
+
+
+def scrivi_dati_app(storico, righe, soglie_predefinite, meta=None):
     """Scrive data/app_data.json: per ogni carta della lista, statistiche,
-    ultima offerta migliore e una serie storica ridotta per i grafici."""
+    segnalazioni, ultima offerta migliore, serie storiche ridotte per i grafici
+    (CardTrader Zero, minimo assoluto, Cardmarket) e informazioni sullo stato.
+    soglie_predefinite: dict con percentile, occasione, ribasso, rialzo.
+    Ritorna il dizionario delle varianti (usato anche per il riepilogo)."""
     varianti = {}
     for riga in righe:
         chiave = chiave_carta(riga)
         record = storico.get(chiave)
         if not record:
             continue
-        prezzi = [r["prezzo"] for r in record.get("rilevazioni", [])]
-        soglia_p = float(riga["percentile_soglia"]) if riga["percentile_soglia"] else percentile_default
-        soglia_o = float(riga["soglia_occasione"]) if riga["soglia_occasione"] else occasione_default
-        soglia_r = float(riga["soglia_ribasso"]) if riga.get("soglia_ribasso") else ribasso_default
+        rilevazioni = record.get("rilevazioni", [])
+        prezzi = [r["prezzo"] for r in rilevazioni]
+        soglia_p = _valore(riga, "percentile_soglia", soglie_predefinite["percentile"])
+        soglia_o = _valore(riga, "soglia_occasione", soglie_predefinite["occasione"])
+        soglia_r = _valore(riga, "soglia_ribasso", soglie_predefinite["ribasso"])
+        soglia_ri = _valore(riga, "soglia_rialzo", soglie_predefinite["rialzo"])
+        obiettivo = _valore(riga, "prezzo_obiettivo", None)
         info = {
             "n": len(prezzi),
             "soglia_percentile": soglia_p,
             "soglia_occasione": soglia_o,
             "soglia_ribasso": soglia_r,
+            "soglia_rialzo": soglia_ri,
+            "obiettivo": obiettivo,
             "fallimenti": record.get("fallimenti_consecutivi", 0),
             "ultimo_errore": record.get("ultimo_errore"),
             "dettaglio": record.get("ultimo_dettaglio"),
-            "serie": _serie_compatta(record.get("rilevazioni", [])),
         }
+        info["serie"], info["fonti"] = _serie_compatta(rilevazioni)
+        cm = record.get("cardmarket") or []
+        info["cm_serie"] = [[t, c["prezzo"]] for c in cm if (t := _ts(c.get("data"))) is not None]
+        info["cm"] = cm[-1] if cm else None
         if prezzi:
             ultimo = prezzi[-1]
             passati = prezzi[:-1]
@@ -677,7 +804,9 @@ def scrivi_dati_app(storico, righe, percentile_default, occasione_default, ribas
                 "media": round(sum(prezzi) / len(prezzi), 4),
                 "tendenza": calcola_tendenza(prezzi[-3:]),
                 "percentile": None,
-                "ultimo_controllo": record["rilevazioni"][-1]["data"],
+                "ultimo_controllo": rilevazioni[-1]["data"],
+                "var7": variazione_7_giorni(rilevazioni),
+                "minimo_assoluto": rilevazioni[-1].get("a"),
             })
             valutazione = valuta_prezzo_basso(passati, ultimo, soglia_p, soglia_r)
             if valutazione:
@@ -686,14 +815,19 @@ def scrivi_dati_app(storico, righe, percentile_default, occasione_default, ribas
             info["prezzo_basso"] = bool(valutazione and valutazione[3])
             det = info["dettaglio"] or {}
             info["occasione"] = det.get("sconto") is not None and det["sconto"] >= soglia_o
+            info["sotto_obiettivo"] = obiettivo is not None and ultimo <= obiettivo
+            rialzo = valuta_rialzo(rilevazioni, soglia_ri)
+            if rialzo:
+                info["rialzo"] = {k: round(v, 2) if isinstance(v, float) else v for k, v in rialzo.items()}
         varianti[chiave] = info
 
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(APP_DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(
-            {"generato": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "varianti": varianti},
+            {"generato": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "meta": meta or {}, "varianti": varianti},
             f, ensure_ascii=False, separators=(",", ":"),
         )
+    return varianti
 
 
 # ---------------------------------------------------------------------------

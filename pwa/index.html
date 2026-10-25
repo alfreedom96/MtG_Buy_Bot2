@@ -112,6 +112,7 @@ main { padding: 8px var(--pad) 40px; max-width: 720px; margin: 0 auto; }
 .gem { width: 10px; height: 10px; border-radius: 2px; transform: rotate(45deg); flex: none; background: var(--silver); }
 .gem.gold { background: var(--gold); }
 .gem.mythic { background: var(--mythic); box-shadow: 0 0 0 3px rgba(242,113,58,.25); }
+.gem.rise { background: #7DB8E8; }
 .gem.wait { background: transparent; border: 1.5px solid var(--muted); }
 .gem.err { background: var(--danger); }
 .empty { text-align: center; color: var(--muted); padding: 48px 12px; }
@@ -119,6 +120,22 @@ main { padding: 8px var(--pad) 40px; max-width: 720px; margin: 0 auto; }
 
 .banner { background: var(--felt-2); border: 1px solid var(--line); border-radius: var(--r-md); padding: 12px 14px; margin: 12px 0 4px; }
 .banner p { margin: 0 0 10px; }
+.banner.allarme { border-color: rgba(239,107,119,.6); }
+.banner.allarme p { color: var(--danger); }
+.variant .var { color: var(--muted); font-size: 14px; min-width: 38px; text-align: right; }
+.ordina { display: inline-flex; align-items: center; gap: 6px; margin-top: 8px; color: var(--muted); font-size: 15px; }
+.ordina select { background: var(--felt-2); border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px; font-size: 15px; }
+.stats.due { grid-template-columns: 1fr 1fr; margin-top: -6px; }
+.stats small + small, .stats b + small { margin-top: 2px; }
+.legenda { display: flex; flex-wrap: wrap; gap: 12px; color: var(--muted); font-size: 13px; margin: 2px 0 6px; }
+.legenda i { display: inline-block; width: 16px; height: 0; vertical-align: middle; margin-right: 5px; border-top: 2px solid; }
+.legenda .l-zero { border-color: var(--ink); }
+.legenda .l-ass { border-color: var(--muted); border-top-style: dashed; }
+.legenda .l-cm { border-color: #7DB8E8; }
+.elenco { list-style: none; margin: 0; padding: 0; }
+.elenco li { padding: 6px 0; border-top: 1px solid var(--felt-3); font-size: 15px; }
+.elenco li:first-child { border-top: 0; }
+.elenco li.warn { color: var(--danger); }
 
 /* ---------- dettaglio ---------- */
 .detail-head { display: flex; gap: 14px; align-items: flex-start; padding: 14px 0 6px; }
@@ -133,6 +150,7 @@ main { padding: 8px var(--pad) 40px; max-width: 720px; margin: 0 auto; }
 .status.mythic { color: var(--mythic); }
 .status.gold { color: var(--gold); }
 .status.err { color: var(--danger); }
+.status.rise { color: #7DB8E8; }
 .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 14px 0; }
 .stats div { background: var(--felt-2); border-radius: var(--r-sm); padding: 8px 10px; }
 .stats small { display: block; color: var(--muted); font-size: 14px; }
@@ -143,7 +161,9 @@ main { padding: 8px var(--pad) 40px; max-width: 720px; margin: 0 auto; }
   position: absolute; top: 0; transform: translateX(-50%);
   background: var(--ink); color: var(--felt); border-radius: var(--r-sm);
   padding: 2px 8px; font-size: 14px; font-weight: 600; white-space: nowrap; pointer-events: none;
+  text-align: center;
 }
+.chart .tip small { display: block; font-weight: 500; font-size: 13px; }
 .ranges { display: flex; gap: 6px; justify-content: flex-end; }
 .ranges button { background: none; border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; font-size: 14px; color: var(--muted); }
 .ranges button[aria-pressed="true"] { color: var(--felt); background: var(--silver); border-color: var(--silver); }
@@ -165,6 +185,8 @@ main { padding: 8px var(--pad) 40px; max-width: 720px; margin: 0 auto; }
 .offerte li .num { font-weight: 600; }
 .offerte li.prima .num { font-weight: 700; color: var(--ink); }
 .offerte li small { display: block; color: var(--muted); font-size: 14px; }
+.offerte li.esclusa > span:not(small) { color: var(--muted); }
+.offerte li.esclusa .num { text-decoration: line-through; }
 .settings-line { color: var(--muted); font-size: 15px; margin: 6px 0 12px; }
 .row-btns { display: flex; gap: 8px; flex-wrap: wrap; }
 
