@@ -3,7 +3,7 @@
    Tutti i dati passano dal Cloudflare Worker (/api/...), protetto da password. */
 
 const DEF_PERCENTILE = 15;
-const DEF_OCCASIONE = 10;
+const DEF_OCCASIONE = 15;
 const DEF_RIBASSO = 5;
 const DEF_RIALZO = 15;
 const SCRYFALL = "https://api.scryfall.com";
@@ -147,7 +147,7 @@ function segnali(c) {
   if (!v || v.prezzo == null) return [];
   const out = [];
   if (v.sotto_obiettivo) out.push({ cls: "mythic", tipo: "obiettivo", testo: `Sotto il tuo obiettivo di ${eur(v.obiettivo)}` });
-  if (v.occasione) out.push({ cls: "mythic", tipo: "occasione", testo: `Occasione: ${Math.round(v.dettaglio.sconto)}% sotto la media delle offerte più economiche` });
+  if (v.occasione) out.push({ cls: "mythic", tipo: "occasione", testo: `Occasione: ${Math.round(v.dettaglio.sconto)}% sotto il prezzo di mercato, ${eur(v.dettaglio.stacco_eur)} in meno della ${v.dettaglio.riferimento_terza ? "terza" : "seconda"} offerta` });
   if (v.prezzo_basso) out.push({ cls: "gold", tipo: "basso", testo: `Prezzo basso: ${Math.round(v.ribasso)}% sotto la mediana storica, tra i più bassi mai registrati` });
   if (v.rialzo && v.rialzo.attivo) out.push({ cls: "rise", tipo: "rialzo", testo: `In rialzo: +${Math.round(v.rialzo.rialzo)}% rispetto ai 3 giorni precedenti` });
   return out;
@@ -425,7 +425,7 @@ function listaOfferte(d) {
       <li class="${i === 0 ? "prima" : ""}${o.esclusa ? " esclusa" : ""}">
         <span class="num">${eur(o.prezzo)}</span>
         <span>${esc([o.condizione, o.lingua ? o.lingua.toUpperCase() : "", o.foil ? "foil" : "non foil", o.espansione].filter(Boolean).join(", "))}
-          <small>${esc(o.venditore || "?")}${o.quantita ? `, ${o.quantita} disp.` : ""}${o.esclusa ? "<br>Esclusa dalla media perché fuori scala" : ""}</small></span>
+          <small>${esc(o.venditore || "?")}${o.quantita ? `, ${o.quantita} disp.` : ""}${o.product_id ? `, offerta n. ${esc(o.product_id)}` : ""}${o.esclusa ? "<br>Esclusa dalla media perché fuori scala" : ""}</small></span>
       </li>`).join("")}
     </ol></details>`;
 }
@@ -487,8 +487,8 @@ function sezioneVariante(c) {
           <p><b>Offerta migliore: ${eur(d.prezzo)}</b></p>
           <p class="muted">${esc([d.condizione, d.lingua ? d.lingua.toUpperCase() : "", d.foil ? "foil" : "non foil", d.espansione].filter(Boolean).join(", "))}</p>
           <p class="muted">Venditore ${esc(d.venditore || "?")}${d.quantita ? `, ${d.quantita} disponibili` : ""}</p>
-          ${d.media20 != null ? `<p class="muted">Media delle ${d.n_riferimento || Math.min(10, d.offerte_valide || 10)} offerte più economiche: ${eur(d.media20)} (minimo ${Math.round(d.sconto)}% sotto)${
-            d.escluse ? `. ${d.escluse === 1 ? "Esclusa 1 offerta fuori scala" : `Escluse ${d.escluse} offerte fuori scala`}, sopra ${eur(d.limite_fuori_scala)}` : ""}</p>` : ""}
+          ${d.mercato != null ? `<p class="muted">Prezzo di mercato ${eur(d.mercato)} (mediana delle altre ${d.n_riferimento} offerte più economiche): il minimo è ${Math.round(d.sconto)}% sotto. Stacco dalla ${d.riferimento_terza ? "terza" : "seconda"} offerta (${eur(d.riferimento)}): ${eur(d.stacco_eur)}, ${Math.round(d.stacco_pct)}%.</p>` :
+            d.media20 != null ? `<p class="muted">Media delle offerte più economiche: ${eur(d.media20)} (minimo ${Math.round(d.sconto)}% sotto)</p>` : ""}
           ${listaOfferte(d)}
           ${d.link ? `<a class="btn primary block" href="${esc(d.link)}" target="_blank" rel="noopener">Apri su CardTrader</a>` : ""}
         </div>` : ""}
@@ -718,7 +718,7 @@ function apriModulo(c) {
     </div>
     <div class="field"><label for="s-occ">Avviso occasione: sconto minimo (%)</label>
       <input class="input num" id="s-occ" inputmode="numeric" placeholder="${DEF_OCCASIONE}" value="${esc(f.soglia_occasione)}">
-      <div class="help">Scatta se l'offerta più economica è almeno questo % sotto la media delle 10 offerte più economiche.</div>
+      <div class="help">Scatta se l'offerta più economica è almeno questo % sotto il prezzo di mercato (la mediana delle altre 10 offerte più economiche) <b>e</b> costa almeno il 10% e 0,40 € meno della seconda offerta.</div>
     </div>
     <div class="sheet-actions">
       <button class="btn" id="f-annulla">Annulla</button>
@@ -835,6 +835,8 @@ async function rimuovi(id) {
 
 /* ------------------------------------------------------------------ stato del sistema */
 
+const ACCETTATE = new Set(["mint", "near mint", "slightly played", "m", "nm", "sp", "nm/m", "near mint/mint"]);
+
 /* GitHub scrive la scadenza come "2026-12-31 23:59:59 UTC" o "... +0100" */
 function dataGitHub(s) {
   if (!s) return null;
@@ -886,6 +888,12 @@ async function apriStato() {
     <div class="field"><span class="lab">Carte con problemi</span>
       ${problemi ? `<ul class="elenco">${problemi}</ul>` : `<p class="settings-line">Nessuna.</p>`}
     </div>
+    ${m.condizioni_viste && Object.keys(m.condizioni_viste).length ? `<div class="field"><span class="lab">Condizioni delle offerte viste nell'ultimo controllo</span>
+      <ul class="elenco">${Object.entries(m.condizioni_viste).map(([cond, n]) =>
+        `<li>${ACCETTATE.has(cond.toLowerCase().replace(/[_-]/g, " ").split(/\s+/).join(" ")) ? "✓" : "✗"} ${esc(cond)}: ${n} offerte</li>`).join("")}</ul>
+      <p class="settings-line">✓ = considerate per prezzi e avvisi (Mint, Near Mint, Slightly Played).</p></div>` : ""}
+    ${m.offerte_scartate && Object.keys(m.offerte_scartate).length ? `<div class="field"><span class="lab">Offerte scartate nell'ultimo controllo</span>
+      <ul class="elenco">${Object.entries(m.offerte_scartate).map(([motivo, n]) => `<li>${esc(motivo)}: ${n}</li>`).join("")}</ul></div>` : ""}
     <div class="field"><span class="lab">Token</span>
       <ul class="elenco">
         ${m.cardtrader_scadenza !== undefined ? rigaToken("CardTrader", m.errore_globale ? { ok: false, codice: 403 } : { ok: true }, m.cardtrader_scadenza ? Date.parse(m.cardtrader_scadenza) : null) : ""}

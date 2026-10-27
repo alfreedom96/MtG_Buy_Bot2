@@ -27,6 +27,22 @@ TELEGRAM_OFFSET_FILE = os.path.join(DATA_DIR, "telegram_offset.json")
 APP_DATA_FILE = os.path.join(DATA_DIR, "app_data.json")
 
 CONDIZIONI_ACCETTATE = {"Mint", "Near Mint", "Slightly Played"}
+# stesse condizioni scritte in modo normalizzato (minuscole, sigle comprese)
+_CONDIZIONI_NORMALIZZATE = {"mint", "near mint", "slightly played", "m", "nm", "sp", "nm/m", "near mint/mint"}
+# conteggio delle condizioni incontrate nell'ultimo controllo (per la pagina Stato)
+from collections import Counter
+CONDIZIONI_VISTE = Counter()
+# offerte scartate per motivo (lingua o finitura diverse da quelle chieste, carte firmate o alterate...)
+OFFERTE_SCARTATE = Counter()
+
+
+def condizione_accettata(condizione):
+    """Mint, Near Mint o Slightly Played, comunque siano scritte
+    (maiuscole, trattini, sigle come NM o SP)."""
+    if not condizione:
+        return False
+    c = " ".join(str(condizione).lower().replace("_", " ").replace("-", " ").split())
+    return c in _CONDIZIONI_NORMALIZZATE
 MINIMO_PUNTI_PER_STATISTICA = 5
 MAX_PUNTI_STORICO = 5000  # circa 70 giorni con un controllo ogni 20 minuti
 SOGLIA_FALLIMENTI_CONSECUTIVI = 10  # dopo quanti fallimenti di fila avvisare
@@ -135,7 +151,7 @@ def leggi_lista_carte(sheet_csv_url):
       - percentile_soglia   (opzionale: numero 1-100 - default DEFAULT_PERCENTILE_SOGLIA)
       - soglia_ribasso      (opzionale: % minimo sotto la mediana storica per il "prezzo basso" - default 5)
       - soglia_occasione    (opzionale: % di sconto del minimo rispetto alla media
-                             delle 10 offerte più economiche - default DEFAULT_SOGLIA_OCCASIONE)
+                             prezzo di mercato, mediana delle altre 10 offerte più economiche - default 15)
       - edizioni_escluse    (opzionale: codici o nomi edizione da ignorare, separati da ; )
       - edizioni_incluse    (opzionale: se compilata, considera SOLO queste edizioni)
     """
@@ -518,10 +534,28 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
                         continue  # per semplicità confrontiamo solo prezzi in EUR
                     prezzo = prezzo_cents / 100.0
 
-                    props = p.get("properties_hash", {})
+                    props = p.get("properties_hash", {}) or {}
                     condizione = props.get("condition")
+                    CONDIZIONI_VISTE[str(condizione)] += 1
 
-                    if condizione not in CONDIZIONI_ACCETTATE:
+                    # Controlli sui dati reali dell'offerta: non mi fido solo dei
+                    # filtri della ricerca (lingua, foil), li verifico prodotto per prodotto
+                    lingua_reale = str(props.get("mtg_language") or lingua or "").lower()
+                    if lingua_reale and lingua_reale not in lingue:
+                        OFFERTE_SCARTATE["lingua diversa"] += 1
+                        continue
+                    foil_reale = props.get("mtg_foil", foil)
+                    if foil_reale is not None and bool(foil_reale) != bool(foil):
+                        OFFERTE_SCARTATE["finitura diversa"] += 1
+                        continue
+                    if props.get("signed") or props.get("altered"):
+                        OFFERTE_SCARTATE["firmata o alterata"] += 1
+                        continue
+                    if user.get("too_many_request_for_cancel_as_seller"):
+                        OFFERTE_SCARTATE["venditore con troppi ordini annullati"] += 1
+                        continue
+
+                    if not condizione_accettata(condizione):
                         # non valido per l'acquisto, ma lo teniamo per l'informazione
                         if ct_zero and (miglior_altre_condizioni is None or prezzo < miglior_altre_condizioni[0]):
                             miglior_altre_condizioni = (prezzo, condizione)
@@ -544,8 +578,9 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
                     offerte_valide.append({
                         "prezzo": prezzo,
                         "condizione": condizione,
-                        "lingua": lingua,
-                        "foil": foil,
+                        "lingua": lingua_reale,
+                        "foil": bool(foil_reale),
+                        "product_id": p.get("id"),
                         "espansione": p.get("expansion", {}).get("name_en"),
                         "venditore": user.get("username"),
                         "quantita": p.get("quantity"),
@@ -554,8 +589,8 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
                         prezzo_nativo = p.get("price", {})
                         miglior = (prezzo, {
                             "condizione": condizione,
-                            "lingua": lingua,
-                            "foil": foil,
+                            "lingua": lingua_reale,
+                            "foil": bool(foil_reale),
                             "espansione": p.get("expansion", {}).get("name_en"),
                             "venditore": user.get("username"),
                             "product_id": p.get("id"),
@@ -598,37 +633,50 @@ def valuta_prezzo_basso(prezzi_passati, prezzo, soglia_percentile, soglia_ribass
     return percentile, mediana, ribasso, percentile <= soglia_percentile and ribasso >= soglia_ribasso
 
 
-def analizza_occasione(prezzi_offerte, soglia_pct, n_riferimento=N_OFFERTE_RIFERIMENTO,
-                       minimo_offerte=5, fattore_fuori_scala=FATTORE_FUORI_SCALA):
-    """Confronta l'offerta più economica con la media delle (fino a) 10 offerte
-    più economiche (minimo incluso).
+STACCO_MIN_PCT = 10.0   # l'offerta deve costare almeno il 10% meno della seconda...
+STACCO_MIN_EUR = 0.40   # ... e almeno 0,40 € meno
 
-    Le offerte "fuori scala" verso l'alto (oltre 1,5 volte la mediana di quelle
-    10, es. una foil a 99 € tra offerte da 47 €) vengono escluse dalla media,
-    perché la gonfierebbero facendo sembrare un'occasione un prezzo normale.
-    Le offerte troppo basse invece restano: sono proprio le occasioni.
 
-    Ritorna un dizionario (media, sconto, occasione, usate, escluse, limite)
-    oppure None se le offerte sono troppo poche per un confronto sensato."""
+def analizza_occasione(prezzi_offerte, soglia_pct, n_riferimento=N_OFFERTE_RIFERIMENTO, minimo_offerte=5,
+                       stacco_pct=STACCO_MIN_PCT, stacco_eur=STACCO_MIN_EUR):
+    """Una "vera occasione": un venditore che vende chiaramente sotto gli altri.
+
+    Prende le (fino a) 10 offerte più economiche e richiede ENTRAMBE le condizioni:
+      1. l'offerta più economica è almeno `soglia_pct` % sotto il PREZZO DI MERCATO,
+         cioè la mediana delle altre offerte (la mediana non si lascia spostare
+         da un'offerta carissima o da una sola molto bassa);
+      2. c'è uno STACCO netto dalla seconda offerta: almeno il 10% e almeno 0,40 €.
+         Se anche la seconda è sotto il mercato della stessa soglia (due venditori
+         economici), lo stacco si misura dalla terza.
+    Ritorna un dizionario oppure None se ci sono meno di 5 offerte."""
     import statistics
     if len(prezzi_offerte) < minimo_offerte:
         return None
     migliori = sorted(prezzi_offerte)[:n_riferimento]
-    limite = statistics.median(migliori) * fattore_fuori_scala
-    usate = [p for p in migliori if p <= limite]
-    if len(usate) < minimo_offerte:
+    minimo = migliori[0]
+    mercato = statistics.median(migliori[1:])
+    if mercato <= 0:
         return None
-    media = sum(usate) / len(usate)
-    if media <= 0:
-        return None
-    sconto = 100 * (media - usate[0]) / media
+    sconto = 100 * (mercato - minimo) / mercato
+    seconda = migliori[1]
+    seconda_economica = seconda <= mercato * (1 - soglia_pct / 100)
+    riferimento = migliori[2] if seconda_economica and len(migliori) > 2 else seconda
+    distacco_eur = riferimento - minimo
+    distacco_pct = 100 * distacco_eur / riferimento if riferimento > 0 else 0.0
+    occasione = sconto >= soglia_pct and distacco_pct >= stacco_pct and distacco_eur >= stacco_eur - 1e-9
     return {
-        "media": media,
+        "mercato": mercato,
+        "media": mercato,  # compatibilità con il codice che usava la media
         "sconto": sconto,
-        "occasione": sconto >= soglia_pct,
-        "usate": len(usate),
-        "escluse": len(migliori) - len(usate),
-        "limite": limite,
+        "seconda": seconda,
+        "riferimento": riferimento,
+        "riferimento_terza": riferimento is not seconda and riferimento != seconda,
+        "stacco_pct": distacco_pct,
+        "stacco_eur": distacco_eur,
+        "occasione": occasione,
+        "usate": len(migliori) - 1,
+        "escluse": 0,
+        "limite": None,
     }
 
 
@@ -814,7 +862,8 @@ def scrivi_dati_app(storico, righe, soglie_predefinite, meta=None):
                 info.update({"percentile": round(perc, 1), "mediana": mediana, "ribasso": round(ribasso, 2)})
             info["prezzo_basso"] = bool(valutazione and valutazione[3])
             det = info["dettaglio"] or {}
-            info["occasione"] = det.get("sconto") is not None and det["sconto"] >= soglia_o
+            info["occasione"] = bool(det.get("occasione")) if "occasione" in det else (
+                det.get("sconto") is not None and det["sconto"] >= soglia_o)
             info["sotto_obiettivo"] = obiettivo is not None and ultimo <= obiettivo
             rialzo = valuta_rialzo(rilevazioni, soglia_ri)
             if rialzo:

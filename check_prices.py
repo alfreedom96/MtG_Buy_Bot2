@@ -60,6 +60,7 @@ from common import (
     valuta_prezzo_basso,
     valuta_rialzo,
 )
+from common import CONDIZIONI_VISTE, OFFERTE_SCARTATE, condizione_accettata
 from mercato import CacheCarte, prezzo_cardmarket
 
 ORE_TRA_PREZZI_CARDMARKET = 6
@@ -154,16 +155,27 @@ def aggiorna_cardmarket(record, stampe, riga):
     return cm
 
 
+GIORNI_MEMORIA_AVVISI = 7
+
+
+def _giorni_fa(iso):
+    try:
+        t = datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+        return (time.time() - t) / 86400
+    except (TypeError, ValueError):
+        return 1e9
+
+
 def controlla_obiettivo(record, nome, chiave, prezzo, obiettivo, dettagli, avvisi):
-    """🎯 Avvisa quando il prezzo scende sotto l'obiettivo. Non ripete finché
-    il prezzo non torna sopra, salvo un ulteriore calo di almeno il 5%."""
-    if obiettivo is None:
-        return
-    if prezzo > obiettivo:
-        record["obiettivo_notificato"] = None
+    """🎯 Avvisa quando il prezzo scende sotto l'obiettivo. Per non ripetersi
+    quando un'offerta compare e scompare: dopo un avviso ne manda un altro solo
+    se il prezzo scende di un ulteriore 5%, oppure dopo 7 giorni."""
+    if obiettivo is None or prezzo > obiettivo:
         return
     ultimo = record.get("obiettivo_notificato")
-    if ultimo is not None and prezzo > ultimo * 0.95:
+    if isinstance(ultimo, (int, float)):  # formato vecchio
+        ultimo = {"prezzo": ultimo, "data": ora_iso()}
+    if ultimo and prezzo > ultimo["prezzo"] * 0.95 and _giorni_fa(ultimo.get("data")) < GIORNI_MEMORIA_AVVISI:
         return
     link = link_pagina_carta(nome, dettagli.get("espansione"))
     avvisi.invia(
@@ -175,7 +187,7 @@ def controlla_obiettivo(record, nome, chiave, prezzo, obiettivo, dettagli, avvis
         f"venditore {dettagli.get('venditore')}.",
         url_carta_app(nome), f"obiettivo-{chiave}",
     )
-    record["obiettivo_notificato"] = prezzo
+    record["obiettivo_notificato"] = {"prezzo": prezzo, "data": ora_iso()}
     print("   -> avviso OBIETTIVO inviato")
 
 
@@ -236,31 +248,50 @@ def controlla_prezzo_basso(record, nome, chiave, prezzo, prezzi_passati, soglie,
 
 
 def controlla_occasione(record, nome, chiave, prezzo, prezzi_offerte, soglia, dettagli, avvisi):
+    """🔥 Occasione. Per evitare avvisi ripetuti o su offerte "fantasma":
+      - l'offerta deve essere la più economica in due controlli di fila
+        (un'offerta che compare e sparisce subito non conta);
+      - la stessa offerta non viene segnalata di nuovo per 7 giorni,
+        anche se nel frattempo sparisce e ricompare."""
     analisi = analizza_occasione(prezzi_offerte, soglia)
     if analisi is None:
         print(f"   occasione: troppe poche offerte ({len(prezzi_offerte)}) per il confronto")
+        record["occasione_candidata"] = None
         return None
-    media, sconto, n = analisi["media"], analisi["sconto"], analisi["usate"]
-    nota = f" ({analisi['escluse']} escluse perché oltre {analisi['limite']:.2f}€)" if analisi["escluse"] else ""
-    print(f"   occasione: media {n} offerte più economiche {media:.2f}€{nota}, sconto {sconto:.1f}% (soglia {soglia:.0f}%)")
+    mercato, sconto = analisi["mercato"], analisi["sconto"]
+    quale = "terza" if analisi["riferimento_terza"] else "seconda"
+    print(f"   occasione: mercato {mercato:.2f}€ (mediana di {analisi['usate']} offerte), minimo {sconto:.1f}% sotto "
+          f"(soglia {soglia:.0f}%); stacco dalla {quale} offerta ({analisi['riferimento']:.2f}€): "
+          f"{analisi['stacco_eur']:.2f}€ = {analisi['stacco_pct']:.1f}% (minimo 10% e 0,40€) -> "
+          f"{'OCCASIONE' if analisi['occasione'] else 'no'}")
+    pid = dettagli.get("product_id")
     if not analisi["occasione"]:
-        record["ultima_occasione"] = None  # si riarma per la prossima
+        record["occasione_candidata"] = None
         return analisi
-    ultima = record.get("ultima_occasione") or {}
-    if ultima.get("product_id") == dettagli.get("product_id") and prezzo >= ultima.get("prezzo", 1e9) - 0.01:
+    candidata = record.get("occasione_candidata")
+    record["occasione_candidata"] = pid
+    if candidata != pid:
+        print("   occasione da confermare al prossimo controllo")
+        return analisi
+    notificate = {k: v for k, v in (record.get("occasioni_notificate") or {}).items()
+                  if _giorni_fa(v) < GIORNI_MEMORIA_AVVISI}
+    record["occasioni_notificate"] = notificate
+    if str(pid) in notificate:
         return analisi
     link = link_pagina_carta(nome, dettagli.get("espansione"))
+    quale = "terza" if analisi["riferimento_terza"] else "seconda"
     avvisi.invia(
-        f"🔥 <b>Occasione: {nome}</b>\n"
-        f"Prezzo minimo: <b>{prezzo:.2f}€</b> — {sconto:.0f}% sotto la media delle {n} offerte più economiche ({media:.2f}€)\n"
-        f"{descrizione_dettagli(dettagli)}\nVenditore: {dettagli.get('venditore')}"
+        f"🔥 <b>Occasione: {nome}</b> a <b>{euro(prezzo)}</b>\n"
+        f"{sconto:.0f}% sotto il prezzo di mercato ({euro(mercato)}). "
+        f"La {quale} offerta più economica costa {euro(analisi['riferimento'])}.\n"
+        f"{descrizione_dettagli(dettagli)}\nVenditore: {dettagli.get('venditore')} (offerta {pid})"
         + (f"\n🔗 {link}" if link else ""),
         f"🔥 Occasione: {nome} a {euro(prezzo)}",
-        f"{sconto:.0f}% sotto la media delle {n} offerte più economiche ({euro(media)}). "
-        f"{dettagli['condizione']}, {dettagli['espansione']}, venditore {dettagli.get('venditore')}.",
+        f"{sconto:.0f}% sotto il prezzo di mercato ({euro(mercato)}); la {quale} offerta costa {euro(analisi['riferimento'])}. "
+        f"{dettagli['condizione']}, {dettagli['lingua'].upper()}, {dettagli['espansione']}, venditore {dettagli.get('venditore')}.",
         url_carta_app(nome), f"occasione-{chiave}",
     )
-    record["ultima_occasione"] = {"product_id": dettagli.get("product_id"), "prezzo": prezzo}
+    notificate[str(pid)] = ora_iso()
     print("   -> avviso OCCASIONE inviato")
     return analisi
 
@@ -292,12 +323,14 @@ def riepilogo_settimanale(varianti, righe, cache):
 
 def main():
     inizio = time.time()
+    CONDIZIONI_VISTE.clear()
+    OFFERTE_SCARTATE.clear()
     ct_token = env("CARDTRADER_TOKEN", required=True)
     tg_token = env("TELEGRAM_BOT_TOKEN", "")
     tg_chat_id = env("TELEGRAM_CHAT_ID", "")
     soglie_predefinite = {
         "percentile": float(env("DEFAULT_PERCENTILE_SOGLIA", "15")),
-        "occasione": float(env("DEFAULT_SOGLIA_OCCASIONE", "10")),
+        "occasione": float(env("DEFAULT_SOGLIA_OCCASIONE", "15")),
         "ribasso": float(env("DEFAULT_SOGLIA_RIBASSO", str(SOGLIA_RIBASSO_PREDEFINITA))),
         "rialzo": float(env("DEFAULT_SOGLIA_RIALZO", str(SOGLIA_RIALZO_PREDEFINITA))),
     }
@@ -393,11 +426,16 @@ def main():
                 "offerte_valide": numero_offerte,
                 "media20": round(analisi["media"], 4) if analisi else None,  # nome storico: media di riferimento
                 "n_riferimento": analisi["usate"] if analisi else None,
-                "escluse": analisi["escluse"] if analisi else 0,
-                "limite_fuori_scala": round(analisi["limite"], 2) if analisi else None,
-                "offerte": [{**o, "esclusa": bool(analisi and o["prezzo"] > analisi["limite"])} for o in offerte_riferimento],
+                "mercato": round(analisi["mercato"], 4) if analisi else None,
+                "riferimento": round(analisi["riferimento"], 2) if analisi else None,
+                "riferimento_terza": bool(analisi and analisi["riferimento_terza"]),
+                "stacco_eur": round(analisi["stacco_eur"], 2) if analisi else None,
+                "stacco_pct": round(analisi["stacco_pct"], 1) if analisi else None,
+                "occasione": bool(analisi and analisi["occasione"]),
+                "offerte": offerte_riferimento,
                 "sconto": round(analisi["sconto"], 2) if analisi else None,
                 "assoluto": assoluto,
+                "product_id": dettagli.get("product_id"),
             }
 
             rilevazioni.append({
@@ -434,6 +472,12 @@ def main():
         print("[avviso] la lista carte risulta vuota: salto la pulizia dello storico per sicurezza")
 
     meta["durata_s"] = round(time.time() - inizio)
+    meta["condizioni_viste"] = dict(CONDIZIONI_VISTE.most_common())
+    meta["offerte_scartate"] = dict(OFFERTE_SCARTATE.most_common())
+    if OFFERTE_SCARTATE:
+        print("Offerte scartate:", ", ".join(f"{c} {n}" for c, n in OFFERTE_SCARTATE.most_common()))
+    if CONDIZIONI_VISTE:
+        print("Condizioni delle offerte viste:", ", ".join(f"{c} {n}" for c, n in CONDIZIONI_VISTE.most_common()))
     salva_storico(storico)
     varianti = scrivi_dati_app(storico, righe, soglie_predefinite, meta)
     if token_ok:

@@ -23,8 +23,8 @@ def main():
     assets = {}
     for nome in sorted(os.listdir(PWA)):
         est = os.path.splitext(nome)[1]
-        if est not in TIPI:
-            continue
+        if est not in TIPI or nome.startswith("logo-"):
+            continue  # i file "logo-..." sono solo sorgenti, non servono all'app
         with open(os.path.join(PWA, nome), "rb") as f:
             dati = f.read()
         if est == ".png":
