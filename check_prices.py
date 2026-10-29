@@ -60,7 +60,7 @@ from common import (
     valuta_prezzo_basso,
     valuta_rialzo,
 )
-from common import CONDIZIONI_VISTE, OFFERTE_SCARTATE, condizione_accettata
+from common import CONDIZIONI_VISTE, ESEMPI_FIRMATE, OFFERTE_SCARTATE, condizione_accettata
 from mercato import CacheCarte, prezzo_cardmarket
 
 ORE_TRA_PREZZI_CARDMARKET = 6
@@ -292,6 +292,11 @@ def controlla_occasione(record, nome, chiave, prezzo, prezzi_offerte, soglia, de
         url_carta_app(nome), f"occasione-{chiave}",
     )
     notificate[str(pid)] = ora_iso()
+    # ricordo l'ultima occasione segnalata, per mostrarla nell'app anche dopo che sparisce
+    record["ultima_occasione_info"] = {
+        "prezzo": prezzo, "venditore": dettagli.get("venditore"), "espansione": dettagli.get("espansione"),
+        "product_id": pid, "data": ora_iso(),
+    }
     print("   -> avviso OCCASIONE inviato")
     return analisi
 
@@ -325,6 +330,7 @@ def main():
     inizio = time.time()
     CONDIZIONI_VISTE.clear()
     OFFERTE_SCARTATE.clear()
+    ESEMPI_FIRMATE.clear()
     ct_token = env("CARDTRADER_TOKEN", required=True)
     tg_token = env("TELEGRAM_BOT_TOKEN", "")
     tg_chat_id = env("TELEGRAM_CHAT_ID", "")
@@ -436,6 +442,8 @@ def main():
                 "sconto": round(analisi["sconto"], 2) if analisi else None,
                 "assoluto": assoluto,
                 "product_id": dettagli.get("product_id"),
+                "ultima_occasione": record.get("ultima_occasione_info")
+                if _giorni_fa((record.get("ultima_occasione_info") or {}).get("data")) < GIORNI_MEMORIA_AVVISI else None,
             }
 
             rilevazioni.append({
@@ -474,6 +482,7 @@ def main():
     meta["durata_s"] = round(time.time() - inizio)
     meta["condizioni_viste"] = dict(CONDIZIONI_VISTE.most_common())
     meta["offerte_scartate"] = dict(OFFERTE_SCARTATE.most_common())
+    meta["esempi_firmate"] = list(ESEMPI_FIRMATE)
     if OFFERTE_SCARTATE:
         print("Offerte scartate:", ", ".join(f"{c} {n}" for c, n in OFFERTE_SCARTATE.most_common()))
     if CONDIZIONI_VISTE:

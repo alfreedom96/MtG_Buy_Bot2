@@ -34,6 +34,13 @@ from collections import Counter
 CONDIZIONI_VISTE = Counter()
 # offerte scartate per motivo (lingua o finitura diverse da quelle chieste, carte firmate o alterate...)
 OFFERTE_SCARTATE = Counter()
+ESEMPI_FIRMATE = []  # valori grezzi visti, per controllare che il filtro sia giusto
+
+
+def _vero(valore):
+    """True solo per valori davvero "sì": evita che una stringa come "false"
+    o "no" venga presa per vera."""
+    return valore is True or str(valore).strip().lower() in ("true", "1", "yes", "si", "sì")
 
 
 def condizione_accettata(condizione):
@@ -548,8 +555,11 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
                     if foil_reale is not None and bool(foil_reale) != bool(foil):
                         OFFERTE_SCARTATE["finitura diversa"] += 1
                         continue
-                    if props.get("signed") or props.get("altered"):
+                    if _vero(props.get("signed")) or _vero(props.get("altered")):
                         OFFERTE_SCARTATE["firmata o alterata"] += 1
+                        if len(ESEMPI_FIRMATE) < 3:
+                            ESEMPI_FIRMATE.append({"signed": props.get("signed"), "altered": props.get("altered"),
+                                                   "product_id": p.get("id")})
                         continue
                     if user.get("too_many_request_for_cancel_as_seller"):
                         OFFERTE_SCARTATE["venditore con troppi ordini annullati"] += 1

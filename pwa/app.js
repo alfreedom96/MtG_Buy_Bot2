@@ -417,6 +417,16 @@ function renderDettaglio(k) {
   for (const c of varianti) disegnaGrafico(c);
 }
 
+/* L'ultima occasione segnalata: è ancora lì o è sparita (venduta o ritirata)? */
+function ultimaOccasione(d) {
+  const u = d.ultima_occasione;
+  if (!u) return "";
+  const quando = dataOra(Date.parse(u.data) / 1000);
+  const ancora = (d.offerte || []).some((o) => String(o.product_id) === String(u.product_id));
+  return `<p class="nota-occasione ${ancora ? "" : "sparita"}">🔥 Occasione segnalata il ${esc(quando)}: ${esc(eur(u.prezzo))} da ${esc(u.venditore || "?")}. ${
+    ancora ? "È ancora disponibile." : "Ora non c'è più tra le offerte: probabilmente è stata venduta o ritirata."}</p>`;
+}
+
 function listaOfferte(d) {
   const offerte = d.offerte || [];
   if (!offerte.length) return "";
@@ -489,6 +499,7 @@ function sezioneVariante(c) {
           <p class="muted">Venditore ${esc(d.venditore || "?")}${d.quantita ? `, ${d.quantita} disponibili` : ""}</p>
           ${d.mercato != null ? `<p class="muted">Prezzo di mercato ${eur(d.mercato)} (mediana delle altre ${d.n_riferimento} offerte più economiche): il minimo è ${Math.round(d.sconto)}% sotto. Stacco dalla ${d.riferimento_terza ? "terza" : "seconda"} offerta (${eur(d.riferimento)}): ${eur(d.stacco_eur)}, ${Math.round(d.stacco_pct)}%.</p>` :
             d.media20 != null ? `<p class="muted">Media delle offerte più economiche: ${eur(d.media20)} (minimo ${Math.round(d.sconto)}% sotto)</p>` : ""}
+          ${ultimaOccasione(d)}
           ${listaOfferte(d)}
           ${d.link ? `<a class="btn primary block" href="${esc(d.link)}" target="_blank" rel="noopener">Apri su CardTrader</a>` : ""}
         </div>` : ""}
