@@ -417,14 +417,18 @@ function renderDettaglio(k) {
   for (const c of varianti) disegnaGrafico(c);
 }
 
-/* L'ultima occasione segnalata: è ancora lì o è sparita (venduta o ritirata)? */
-function ultimaOccasione(d) {
-  const u = d.ultima_occasione;
+/* L'ultimo avviso di prezzo: quell'offerta c'è ancora? allo stesso prezzo? */
+const TIPI_AVVISO = { obiettivo: "🎯 Avviso prezzo obiettivo", basso: "💰 Avviso prezzo basso", occasione: "🔥 Avviso occasione" };
+function ultimoAvviso(d) {
+  const u = d.ultimo_avviso || (d.ultima_occasione && { ...d.ultima_occasione, tipo: "occasione" });
   if (!u) return "";
   const quando = dataOra(Date.parse(u.data) / 1000);
-  const ancora = (d.offerte || []).some((o) => String(o.product_id) === String(u.product_id));
-  return `<p class="nota-occasione ${ancora ? "" : "sparita"}">🔥 Occasione segnalata il ${esc(quando)}: ${esc(eur(u.prezzo))} da ${esc(u.venditore || "?")}. ${
-    ancora ? "È ancora disponibile." : "Ora non c'è più tra le offerte: probabilmente è stata venduta o ritirata."}</p>`;
+  const ora = u.product_id != null ? (d.offerte || []).find((o) => String(o.product_id) === String(u.product_id)) : null;
+  let esito, cls = "sparita";
+  if (ora && Math.abs(ora.prezzo - u.prezzo) < 0.005) { esito = "È ancora disponibile allo stesso prezzo."; cls = ""; }
+  else if (ora) esito = `Ora lo stesso venditore la vende a ${eur(ora.prezzo)}: ha cambiato prezzo.`;
+  else esito = "Ora quell'offerta non è più tra le più economiche: venduta, ritirata o rincarata.";
+  return `<p class="nota-occasione ${cls}">${TIPI_AVVISO[u.tipo] || "Avviso"} del ${esc(quando)}: ${esc(eur(u.prezzo))} da ${esc(u.venditore || "?")}. ${esc(esito)}</p>`;
 }
 
 function listaOfferte(d) {
@@ -499,7 +503,7 @@ function sezioneVariante(c) {
           <p class="muted">Venditore ${esc(d.venditore || "?")}${d.quantita ? `, ${d.quantita} disponibili` : ""}</p>
           ${d.mercato != null ? `<p class="muted">Prezzo di mercato ${eur(d.mercato)} (mediana delle altre ${d.n_riferimento} offerte più economiche): il minimo è ${Math.round(d.sconto)}% sotto. Stacco dalla ${d.riferimento_terza ? "terza" : "seconda"} offerta (${eur(d.riferimento)}): ${eur(d.stacco_eur)}, ${Math.round(d.stacco_pct)}%.</p>` :
             d.media20 != null ? `<p class="muted">Media delle offerte più economiche: ${eur(d.media20)} (minimo ${Math.round(d.sconto)}% sotto)</p>` : ""}
-          ${ultimaOccasione(d)}
+          ${ultimoAvviso(d)}
           ${listaOfferte(d)}
           ${d.link ? `<a class="btn primary block" href="${esc(d.link)}" target="_blank" rel="noopener">Apri su CardTrader</a>` : ""}
         </div>` : ""}

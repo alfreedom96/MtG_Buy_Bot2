@@ -166,6 +166,15 @@ def _giorni_fa(iso):
         return 1e9
 
 
+def segna_avviso(record, tipo, prezzo, dettagli):
+    """Ricorda l'ultimo avviso di prezzo (obiettivo, prezzo basso, occasione):
+    l'app lo mostra e controlla se quell'offerta c'è ancora e a che prezzo."""
+    record["ultimo_avviso"] = {
+        "tipo": tipo, "prezzo": prezzo, "venditore": dettagli.get("venditore"),
+        "espansione": dettagli.get("espansione"), "product_id": dettagli.get("product_id"), "data": ora_iso(),
+    }
+
+
 def controlla_obiettivo(record, nome, chiave, prezzo, obiettivo, dettagli, avvisi):
     """🎯 Avvisa quando il prezzo scende sotto l'obiettivo. Per non ripetersi
     quando un'offerta compare e scompare: dopo un avviso ne manda un altro solo
@@ -188,6 +197,7 @@ def controlla_obiettivo(record, nome, chiave, prezzo, obiettivo, dettagli, avvis
         url_carta_app(nome), f"obiettivo-{chiave}",
     )
     record["obiettivo_notificato"] = {"prezzo": prezzo, "data": ora_iso()}
+    segna_avviso(record, "obiettivo", prezzo, dettagli)
     print("   -> avviso OBIETTIVO inviato")
 
 
@@ -244,6 +254,7 @@ def controlla_prezzo_basso(record, nome, chiave, prezzo, prezzi_passati, soglie,
             url_carta_app(nome), f"basso-{chiave}",
         )
         record["ultima_notifica_prezzo"] = prezzo
+        segna_avviso(record, "basso", prezzo, dettagli)
         print("   -> avviso PREZZO BASSO inviato")
 
 
@@ -293,6 +304,7 @@ def controlla_occasione(record, nome, chiave, prezzo, prezzi_offerte, soglia, de
     )
     notificate[str(pid)] = ora_iso()
     # ricordo l'ultima occasione segnalata, per mostrarla nell'app anche dopo che sparisce
+    segna_avviso(record, "occasione", prezzo, dettagli)
     record["ultima_occasione_info"] = {
         "prezzo": prezzo, "venditore": dettagli.get("venditore"), "espansione": dettagli.get("espansione"),
         "product_id": pid, "data": ora_iso(),
@@ -442,6 +454,8 @@ def main():
                 "sconto": round(analisi["sconto"], 2) if analisi else None,
                 "assoluto": assoluto,
                 "product_id": dettagli.get("product_id"),
+                "ultimo_avviso": record.get("ultimo_avviso")
+                if _giorni_fa((record.get("ultimo_avviso") or {}).get("data")) < GIORNI_MEMORIA_AVVISI else None,
                 "ultima_occasione": record.get("ultima_occasione_info")
                 if _giorni_fa((record.get("ultima_occasione_info") or {}).get("data")) < GIORNI_MEMORIA_AVVISI else None,
             }
