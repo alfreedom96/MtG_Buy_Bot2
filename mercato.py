@@ -21,7 +21,7 @@ import time
 
 import requests
 
-from common import DATA_DIR, SCRYFALL_BASE, SCRYFALL_HEADERS, _norm_edizione, pulisci_nome
+from common import DATA_DIR, SCRYFALL_BASE, SCRYFALL_HEADERS, _norm_edizione, pulisci_nome  # noqa: E402
 
 CACHE_FILE = os.path.join(DATA_DIR, "cache_carte.json")
 ORE_SCRYFALL = 6
@@ -92,6 +92,31 @@ def scarica_stampe(nome_carta):
     return stampe
 
 
+def nome_confrontabile(nome):
+    """Minuscole, apici e virgolette uniformati, punteggiatura tolta:
+    'Dr. Leonard "Bones" McCoy' -> 'dr leonard bones mccoy'."""
+    import re
+    n = pulisci_nome(nome).lower().replace("’", "'").replace("“", '"').replace("”", '"')
+    n = re.sub(r"[^\w\s/]", " ", n)
+    return " ".join(n.split())
+
+
+def stesso_nome(nome_blueprint, nome_carta):
+    """Il blueprint di CardTrader è la carta cercata? Accetta anche:
+      - un'aggiunta tra parentesi: 'Rinoa, Angel Wing (Extended Art)'
+      - carte doppie scritte per intero: 'Fronte // Retro' cercando 'Fronte'"""
+    b, n = nome_confrontabile(nome_blueprint), nome_confrontabile(nome_carta)
+    if b == n:
+        return True
+    grezzo = pulisci_nome(nome_blueprint).lower()
+    cercato = pulisci_nome(nome_carta).lower()
+    if grezzo.startswith(cercato + " (") or grezzo.startswith(cercato + " - "):
+        return True
+    if " // " in grezzo and nome_confrontabile(grezzo.split(" // ")[0]) == n:
+        return True
+    return False
+
+
 def _rilevante_per_ristampe(s):
     return not s["digitale"] and s["tipo"] not in TIPI_SET_IGNORATI
 
@@ -108,6 +133,13 @@ class CacheCarte:
                 print("[avviso] memoria delle carte illeggibile: la ricreo")
         self.dati.setdefault("carte", {})
         self.dati.setdefault("meta", {})
+        # versione 2: confronto dei nomi più tollerante -> rifaccio le ricerche
+        # memorizzate (soprattutto quelle che non avevano trovato nulla)
+        if self.dati["meta"].get("versione_ricerca") != 2:
+            for voce in self.dati["carte"].values():
+                voce.pop("blueprint", None)
+                voce.pop("simili", None)
+            self.dati["meta"]["versione_ricerca"] = 2
 
     @property
     def meta(self):
@@ -160,9 +192,14 @@ class CacheCarte:
             if e.response is not None and e.response.status_code in (401, 403):
                 raise  # token rifiutato: lo gestisce il controllo principale
             return []  # errore temporaneo: non lo memorizzo, riprovo al prossimo giro
-        nome_lower = pulisci_nome(nome_carta).lower()
-        ids = [bp["id"] for bp in blueprints if bp.get("name", "").strip().lower() == nome_lower]
+        ids = [bp["id"] for bp in blueprints if stesso_nome(bp.get("name", ""), nome_carta)]
         v["blueprint"][chiave] = ids
+        if not ids:
+            # per capire perché non la trova: i nomi più simili in quell'espansione
+            import difflib
+            nomi = sorted({bp.get("name", "") for bp in blueprints if bp.get("name")})
+            simili = difflib.get_close_matches(pulisci_nome(nome_carta), nomi, n=3, cutoff=0.5)
+            v.setdefault("simili", {})[chiave] = simili
         time.sleep(0.4)  # rispetto dei limiti di CardTrader
         return ids
 

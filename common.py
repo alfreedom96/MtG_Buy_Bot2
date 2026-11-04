@@ -310,7 +310,12 @@ class CardTraderClient:
         return self._nomi_espansioni.get(code, "")
 
     def blueprints_per_espansione(self, expansion_id):
-        return self._get("/blueprints/export", params={"expansion_id": expansion_id})
+        # nello stesso giro più carte possono chiedere la stessa espansione: la scarico una volta
+        if not hasattr(self, "_bp_cache"):
+            self._bp_cache = {}
+        if expansion_id not in self._bp_cache:
+            self._bp_cache[expansion_id] = self._get("/blueprints/export", params={"expansion_id": expansion_id})
+        return self._bp_cache[expansion_id]
 
     def marketplace_products(self, blueprint_id, language=None, foil=None):
         params = {"blueprint_id": blueprint_id}
@@ -446,6 +451,35 @@ def trova_blueprint_ids(ct_client, nome_carta, escluse=None, incluse=None, cache
             if bp.get("name", "").strip().lower() == nome_lower:
                 blueprint_ids.add(bp["id"])
         time.sleep(0.4)  # rispetto dei rate limit
+
+    # Ricerca di riserva: CardTrader a volte mette le carte in un'espansione
+    # diversa da quella di Scryfall (mazzi Commander, edizioni speciali...).
+    # Se non ho trovato niente, provo le espansioni CardTrader il cui nome
+    # contiene le prime due parole dell'edizione Scryfall (es. "final fantasy").
+    if not blueprint_ids and cache is not None:
+        radici = set()
+        for s in cache.stampe(nome_carta)[0]:
+            parole = _norm_edizione(s.get("nome_set", "")).split("-")[:2]
+            if len(parole) == 2 and all(parole):
+                radici.add("-".join(parole))
+        candidati = []
+        for code, eid in espansioni.items():
+            if eid in expansion_ids_da_controllare:
+                continue
+            nome_exp = ct_client.nome_espansione(code)
+            if any(r in nome_exp for r in radici):
+                if corrisponde(code, escluse) or (incluse and not corrisponde(code, incluse)):
+                    continue
+                candidati.append((code, eid))
+        trovate = []
+        for code, eid in candidati[:15]:
+            ids = cache.blueprint(ct_client, nome_carta, eid)
+            if ids:
+                blueprint_ids.update(ids)
+                trovate.append(code)
+        cache._voce(nome_carta)["trovata_in"] = trovate
+        if trovate:
+            print(f"   [nota] trovata in un'espansione diversa da Scryfall: {', '.join(trovate)}")
 
     return blueprint_ids
 
