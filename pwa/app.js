@@ -439,7 +439,7 @@ function listaOfferte(d) {
       <li class="${i === 0 ? "prima" : ""}${o.esclusa ? " esclusa" : ""}">
         <span class="num">${eur(o.prezzo)}</span>
         <span>${esc([o.condizione, o.lingua ? o.lingua.toUpperCase() : "", o.foil ? "foil" : "non foil", o.espansione].filter(Boolean).join(", "))}
-          <small>${esc(o.venditore || "?")}${o.quantita ? `, ${o.quantita} disp.` : ""}${o.product_id ? `, offerta n. ${esc(o.product_id)}` : ""}${o.dal_controllo_precedente ? "<br>Vista nel controllo precedente (CardTrader non l'ha restituita in quest'ultimo)" : ""}${o.esclusa ? "<br>Esclusa dalla media perché fuori scala" : ""}</small></span>
+          <small>${esc(o.venditore || "?")}${o.quantita ? `, ${o.quantita} disp.` : ""}${o.product_id ? `, offerta n. ${esc(o.product_id)}` : ""}${o.dal_controllo_precedente ? `<br>Non restituita da CardTrader nell'ultimo controllo${o.visto ? `, vista l'ultima volta ${esc(tempoFa(o.visto))}` : ""}` : ""}${o.esclusa ? "<br>Esclusa dalla media perché fuori scala" : ""}</small></span>
       </li>`).join("")}
     </ol></details>`;
 }

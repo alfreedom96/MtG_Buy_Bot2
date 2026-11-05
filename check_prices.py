@@ -421,7 +421,8 @@ def main():
                 print(f"   Cardmarket: {cm[0]:.2f}€ ({cm[1]})")
 
             ultime = record.get("ultime_offerte") or {}
-            precedenti = ultime.get("offerte") if _giorni_fa(ultime.get("data")) * 1440 <= 40 else None
+            # formato vecchio: offerte senza "visto" -> uso la data del salvataggio
+            precedenti = [dict(o, visto=o.get("visto") or ultime.get("data")) for o in ultime.get("offerte", [])]
             risultato, errore = miglior_prezzo(
                 ct_client, nome, riga["lingua"], riga["foil"],
                 riga.get("edizioni_escluse"), riga.get("edizioni_incluse"), cache, precedenti,
@@ -450,16 +451,23 @@ def main():
             record["ultime_offerte"] = {"data": ora_iso(), "offerte": dettagli.pop("offerte_da_salvare", [])}
             aggiunte = dettagli.pop("aggiunte_dal_precedente", 0)
             if aggiunte:
-                print(f"   {aggiunte} offerte prese dal controllo precedente (assenti nella risposta di adesso)")
+                print(f"   {aggiunte} offerte prese dalla memoria delle ultime 2 ore (assenti nella risposta di adesso)")
             rilevazioni = record.get("rilevazioni", [])
             prezzi_passati = [r["prezzo"] for r in rilevazioni]
             print(f"   prezzo: {prezzo:.2f}€ ({descrizione_dettagli(dettagli)}, venditore {dettagli.get('venditore')}, "
                   f"{numero_offerte} offerte valide)"
                   + (f"; minimo assoluto {assoluto['prezzo']:.2f}€ ({assoluto['venditore']})" if assoluto else ""))
 
-            controlla_obiettivo(record, nome_avviso(riga), chiave, prezzo, obiettivo, dettagli, avvisi)
-            controlla_prezzo_basso(record, nome_avviso(riga), chiave, prezzo, prezzi_passati, soglie, dettagli, numero_offerte, avvisi)
-            analisi = controlla_occasione(record, nome_avviso(riga), chiave, prezzo, prezzi_offerte, soglie["occasione"], dettagli, avvisi)
+            dalla_memoria = dettagli.pop("dalla_memoria", False)
+            if dalla_memoria:
+                # l'offerta migliore non era nella risposta di adesso: la uso per prezzo e
+                # grafico, ma non mando avvisi su un'offerta che potrebbe essere già venduta
+                print("   offerta migliore presa dalla memoria (non restituita adesso): nessun avviso in questo giro")
+                analisi = analizza_occasione(prezzi_offerte, soglie["occasione"])
+            else:
+                controlla_obiettivo(record, nome_avviso(riga), chiave, prezzo, obiettivo, dettagli, avvisi)
+                controlla_prezzo_basso(record, nome_avviso(riga), chiave, prezzo, prezzi_passati, soglie, dettagli, numero_offerte, avvisi)
+                analisi = controlla_occasione(record, nome_avviso(riga), chiave, prezzo, prezzi_offerte, soglie["occasione"], dettagli, avvisi)
 
             # Dettaglio dell'offerta migliore, mostrato nell'app
             record["ultimo_dettaglio"] = {

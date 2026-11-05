@@ -61,6 +61,7 @@ SOGLIA_FALLIMENTI_CONSECUTIVI = 10  # dopo quanti fallimenti di fila avvisare
 N_OFFERTE_RIFERIMENTO = 10  # occasione: confronto con la media delle N offerte più economiche
 FATTORE_FUORI_SCALA = 1.5  # occasione: escluse le offerte oltre 1,5 volte la mediana delle 10 più economiche
 SOGLIA_RIBASSO_PREDEFINITA = 5.0
+ORE_MEMORIA_OFFERTE = 2  # offerte non restituite da CardTrader restano valide per 2 ore
 SOGLIA_RIALZO_PREDEFINITA = 15.0  # avviso impennata: +15% ...
 GIORNI_RIALZO = 3                 # ... rispetto ai 3 giorni precedenti
 ORE_LIVELLO_ATTUALE = 6           # livello attuale = mediana delle ultime 6 ore  # "prezzo basso": almeno questo % sotto la mediana storica
@@ -629,6 +630,7 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
 
                     prezzo_nativo = p.get("price", {}) or {}
                     raccolte.append({
+                        "visto": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "prezzo": prezzo,
                         "condizione": condizione,
                         "lingua": lingua_reale,
@@ -647,13 +649,20 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
         # Risposta incompleta: meglio non registrare niente che un minimo sbagliato
         return None, f"{INCOMPLETO}{ricerche_fallite} ricerche su CardTrader non hanno risposto"
 
-    # Unione con le offerte del controllo precedente: CardTrader risponde con due
-    # versioni del mercato non allineate, in ognuna delle quali mancano offerte
-    # diverse. Le offerte viste nel giro prima (e non in questo) restano valide
-    # per un controllo; se un'offerta c'è in entrambi vale il prezzo di adesso.
+    # Unione con le offerte dei controlli precedenti: CardTrader risponde con due
+    # versioni del mercato non allineate (anche più volte di fila la stessa), in
+    # ognuna delle quali mancano offerte diverse. Un'offerta vista nelle ultime
+    # 2 ore e assente adesso resta valida; se c'è anche adesso vale il prezzo attuale.
     ids_ora = {o["product_id"] for o in raccolte}
+    limite = time.time() - ORE_MEMORIA_OFFERTE * 3600
+    def recente(o):
+        try:
+            import calendar
+            return calendar.timegm(time.strptime(o.get("visto", ""), "%Y-%m-%dT%H:%M:%SZ")) >= limite
+        except ValueError:
+            return False
     dal_precedente = [dict(o, dal_controllo_precedente=True) for o in (precedenti or [])
-                      if o.get("product_id") not in ids_ora]
+                      if o.get("product_id") not in ids_ora and recente(o)]
     risultato = riassumi_offerte(raccolte + dal_precedente)
     if risultato is None:
         if miglior_altre_condizioni:
@@ -669,7 +678,11 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
     dettagli["aggiunte_dal_precedente"] = len(dal_precedente)
     # da salvare per il prossimo giro: solo quelle viste ADESSO (così un'offerta
     # sparita resta al massimo un controllo in più), le 40 più economiche
-    dettagli["offerte_da_salvare"] = sorted(raccolte, key=lambda o: o["prezzo"])[:40]
+    # per il prossimo giro: le offerte viste adesso più quelle ancora in memoria
+    dettagli["offerte_da_salvare"] = [
+        {k: v for k, v in o.items() if k != "dal_controllo_precedente"}
+        for o in sorted(raccolte + dal_precedente, key=lambda o: o["prezzo"])[:60]
+    ]
     return (prezzo, dettagli, numero), None
 
 
@@ -689,9 +702,10 @@ def riassumi_offerte(offerte):
         "minimo_assoluto": {"prezzo": tutte["prezzo"], "venditore": tutte["venditore"],
                             "espansione": tutte["espansione"], "ct_zero": bool(tutte.get("ct_zero"))},
         "prezzi_offerte": [o["prezzo"] for o in zero],
+        "dalla_memoria": bool(m.get("dal_controllo_precedente")),
         "offerte_riferimento": [
             {k: o.get(k) for k in ("prezzo", "condizione", "lingua", "foil", "product_id", "espansione",
-                                   "venditore", "quantita", "dal_controllo_precedente") if o.get(k) is not None}
+                                   "venditore", "quantita", "dal_controllo_precedente", "visto") if o.get(k) is not None}
             for o in zero[:N_OFFERTE_RIFERIMENTO]
         ],
     }
