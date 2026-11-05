@@ -37,6 +37,8 @@ OFFERTE_SCARTATE = Counter()
 ESEMPI_FIRMATE = []
 # ricerche su CardTrader fallite nell'ultimo controllo, per codice di errore
 RICHIESTE_FALLITE = Counter()
+# intestazioni tecniche delle risposte del mercato (per capire se c'è una cache di mezzo)
+INTESTAZIONI_RISPOSTE = Counter()
 INCOMPLETO = "INCOMPLETO: "  # prefisso degli errori dovuti a risposte mancanti di CardTrader  # valori grezzi visti, per controllare che il filtro sia giusto
 
 
@@ -275,13 +277,19 @@ class CardTraderClient:
         self._expansions = None
         self._nomi_espansioni = {}
 
-    def _get(self, path, params=None, tentativi=4):
+    def _get(self, path, params=None, tentativi=4, fresco=False):
         url = f"{CARDTRADER_BASE}{path}"
+        intestazioni = dict(self.headers)
+        if fresco:
+            # Chiedo dati appena letti, non una copia in memoria (cache) intermedia:
+            # le risposte del mercato alternavano due versioni diverse dei dati.
+            intestazioni.update({"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"})
+            params = {**(params or {}), "_": int(time.time() * 1000)}
         attese = [2, 5, 10, 20]
         ultimo_errore = None
         for tentativo in range(tentativi):
             try:
-                r = requests.get(url, headers=self.headers, params=params, timeout=30)
+                r = requests.get(url, headers=intestazioni, params=params, timeout=30)
             except requests.RequestException as e:
                 ultimo_errore = e
                 time.sleep(attese[min(tentativo, len(attese) - 1)])
@@ -291,6 +299,10 @@ class CardTraderClient:
                 time.sleep(attese[min(tentativo, len(attese) - 1)])
                 continue
             r.raise_for_status()
+            if fresco:
+                for h in ("server", "cf-cache-status", "x-cache", "age", "via", "x-served-by", "x-runtime"):
+                    if h in r.headers:
+                        INTESTAZIONI_RISPOSTE[f"{h}: {r.headers[h] if h not in ('age', 'x-runtime') else 'presente'}"] += 1
             return r.json()
         # esauriti i tentativi
         if ultimo_errore:
@@ -326,7 +338,7 @@ class CardTraderClient:
             params["language"] = language
         if foil is not None:
             params["foil"] = str(foil).lower()
-        data = self._get("/marketplace/products", params=params)
+        data = self._get("/marketplace/products", params=params, fresco=True)
         # la risposta è {blueprint_id: [prodotti]}
         prodotti = []
         for lista in data.values():

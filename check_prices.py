@@ -60,7 +60,8 @@ from common import (
     valuta_prezzo_basso,
     valuta_rialzo,
 )
-from common import CONDIZIONI_VISTE, ESEMPI_FIRMATE, INCOMPLETO, OFFERTE_SCARTATE, RICHIESTE_FALLITE, condizione_accettata
+from common import (CONDIZIONI_VISTE, ESEMPI_FIRMATE, INCOMPLETO, INTESTAZIONI_RISPOSTE, OFFERTE_SCARTATE,
+                    RICHIESTE_FALLITE, condizione_accettata)
 from mercato import CacheCarte, prezzo_cardmarket
 
 ORE_TRA_PREZZI_CARDMARKET = 6
@@ -344,6 +345,7 @@ def main():
     OFFERTE_SCARTATE.clear()
     ESEMPI_FIRMATE.clear()
     RICHIESTE_FALLITE.clear()
+    INTESTAZIONI_RISPOSTE.clear()
     incomplete = 0
     ct_token = env("CARDTRADER_TOKEN", required=True)
     tg_token = env("TELEGRAM_BOT_TOKEN", "")
@@ -509,6 +511,7 @@ def main():
     meta["offerte_scartate"] = dict(OFFERTE_SCARTATE.most_common())
     meta["esempi_firmate"] = list(ESEMPI_FIRMATE)
     meta["richieste_fallite"] = dict(RICHIESTE_FALLITE)
+    meta["intestazioni_risposte"] = dict(INTESTAZIONI_RISPOSTE.most_common(12))
     meta["carte_saltate_risposta_incompleta"] = incomplete
     if RICHIESTE_FALLITE:
         print("Ricerche CardTrader fallite:", dict(RICHIESTE_FALLITE), f"- carte saltate: {incomplete}")
