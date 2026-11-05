@@ -100,6 +100,19 @@ def descrizione_dettagli(d):
     return f"{d['condizione']}, {d['lingua'].upper()}, {'foil' if d['foil'] else 'non foil'}, {d['espansione']}"
 
 
+SUFFISSO_FOIL = " (foil)"
+
+
+def nome_avviso(riga):
+    """Nome mostrato negli avvisi: per le varianti solo foil aggiunge "(foil)"."""
+    return riga["nome_carta"] + (SUFFISSO_FOIL if riga["foil"] == "si" else "")
+
+
+def base(nome):
+    """Nome della carta senza "(foil)", per link e indirizzi."""
+    return nome[: -len(SUFFISSO_FOIL)] if nome.endswith(SUFFISSO_FOIL) else nome
+
+
 def gestisci_fallimento(record, nome, motivo, avvisi):
     """Conta i fallimenti consecutivi di una carta e, oltre la soglia, manda
     un avviso tecnico una sola volta (finché non torna a funzionare)."""
@@ -116,7 +129,7 @@ def gestisci_fallimento(record, nome, motivo, avvisi):
             f"Controlla il nome della carta o i filtri impostati.",
             f"⚠️ {nome}: nessun risultato",
             f"{record['fallimenti_consecutivi']} controlli falliti di fila. Ultimo motivo: {motivo}",
-            url_carta_app(nome), f"errore-{nome.lower()}",
+            url_carta_app(base(nome)), f"errore-{nome.lower()}",
         )
         record["allarme_fallimento_inviato"] = True
 
@@ -135,7 +148,7 @@ def avvisa_ristampe(nome, nuove, avvisi):
             f"Spesso dopo una ristampa il prezzo scende: può convenire aspettare.",
             f"🆕 Ristampa: {nome}",
             f"{s['nome_set']}, {quando}. Spesso dopo una ristampa il prezzo scende: può convenire aspettare.",
-            url_carta_app(nome), f"ristampa-{nome.lower()}-{s['set']}",
+            url_carta_app(base(nome)), f"ristampa-{nome.lower()}-{s['set']}",
         )
         print(f"   -> avviso RISTAMPA: {s['nome_set']}")
 
@@ -187,7 +200,7 @@ def controlla_obiettivo(record, nome, chiave, prezzo, obiettivo, dettagli, avvis
         ultimo = {"prezzo": ultimo, "data": ora_iso()}
     if ultimo and prezzo > ultimo["prezzo"] * 0.95 and _giorni_fa(ultimo.get("data")) < GIORNI_MEMORIA_AVVISI:
         return
-    link = link_pagina_carta(nome, dettagli.get("espansione"))
+    link = link_pagina_carta(base(nome), dettagli.get("espansione"))
     avvisi.invia(
         f"🎯 <b>{nome}</b> a {euro(prezzo)}, sotto il tuo obiettivo di {euro(obiettivo)}\n"
         f"{descrizione_dettagli(dettagli)}\nVenditore: {dettagli.get('venditore')}"
@@ -195,7 +208,7 @@ def controlla_obiettivo(record, nome, chiave, prezzo, obiettivo, dettagli, avvis
         f"🎯 {nome} a {euro(prezzo)}",
         f"Sotto il tuo obiettivo di {euro(obiettivo)}. {dettagli['condizione']}, {dettagli['espansione']}, "
         f"venditore {dettagli.get('venditore')}.",
-        url_carta_app(nome), f"obiettivo-{chiave}",
+        url_carta_app(base(nome)), f"obiettivo-{chiave}",
     )
     record["obiettivo_notificato"] = {"prezzo": prezzo, "data": ora_iso()}
     segna_avviso(record, "obiettivo", prezzo, dettagli)
@@ -222,7 +235,7 @@ def controlla_rialzo(record, nome, chiave, rilevazioni, soglia, avvisi):
         f"📈 {nome} in rialzo: +{r['rialzo']:.0f}%",
         f"Ora {euro(r['livello'])}, nei giorni precedenti {euro(r['riferimento'])}. "
         f"Se ti serve, potrebbe convenire comprare prima che salga ancora.",
-        url_carta_app(nome), f"rialzo-{chiave}",
+        url_carta_app(base(nome)), f"rialzo-{chiave}",
     )
     record["rialzo_notificato"] = r["livello"]
     print("   -> avviso RIALZO inviato")
@@ -241,7 +254,7 @@ def controlla_prezzo_basso(record, nome, chiave, prezzo, prezzi_passati, soglie,
           f"storica {mediana:.2f}€ (soglia {soglie['ribasso']:.0f}%), tendenza: {tendenza}")
     ultima = record.get("ultima_notifica_prezzo")
     if basso and (ultima is None or prezzo < ultima - 0.01):
-        link = link_pagina_carta(nome, dettagli.get("espansione"))
+        link = link_pagina_carta(base(nome), dettagli.get("espansione"))
         avvisi.invia(
             f"💰 <b>{nome}</b>\n"
             f"Prezzo attuale: {prezzo:.2f}€ — tra i più bassi mai visti, {ribasso:.0f}% sotto la mediana storica "
@@ -252,7 +265,7 @@ def controlla_prezzo_basso(record, nome, chiave, prezzo, prezzi_passati, soglie,
             f"💰 {nome} a {euro(prezzo)}",
             f"{ribasso:.0f}% sotto la mediana storica ({euro(mediana)}), tra i prezzi più bassi mai visti. "
             f"{dettagli['condizione']}, {dettagli['espansione']}.",
-            url_carta_app(nome), f"basso-{chiave}",
+            url_carta_app(base(nome)), f"basso-{chiave}",
         )
         record["ultima_notifica_prezzo"] = prezzo
         segna_avviso(record, "basso", prezzo, dettagli)
@@ -290,7 +303,7 @@ def controlla_occasione(record, nome, chiave, prezzo, prezzi_offerte, soglia, de
     record["occasioni_notificate"] = notificate
     if str(pid) in notificate:
         return analisi
-    link = link_pagina_carta(nome, dettagli.get("espansione"))
+    link = link_pagina_carta(base(nome), dettagli.get("espansione"))
     quale = "terza" if analisi["riferimento_terza"] else "seconda"
     avvisi.invia(
         f"🔥 <b>Occasione: {nome}</b> a <b>{euro(prezzo)}</b>\n"
@@ -301,7 +314,7 @@ def controlla_occasione(record, nome, chiave, prezzo, prezzi_offerte, soglia, de
         f"🔥 Occasione: {nome} a {euro(prezzo)}",
         f"{sconto:.0f}% sotto il prezzo di mercato ({euro(mercato)}); la {quale} offerta costa {euro(analisi['riferimento'])}. "
         f"{dettagli['condizione']}, {dettagli['lingua'].upper()}, {dettagli['espansione']}, venditore {dettagli.get('venditore')}.",
-        url_carta_app(nome), f"occasione-{chiave}",
+        url_carta_app(base(nome)), f"occasione-{chiave}",
     )
     notificate[str(pid)] = ora_iso()
     # ricordo l'ultima occasione segnalata, per mostrarla nell'app anche dopo che sparisce
@@ -421,7 +434,7 @@ def main():
                 continue
             if errore:
                 print(f"   {errore}")
-                gestisci_fallimento(record, nome, errore, avvisi)
+                gestisci_fallimento(record, nome_avviso(riga), errore, avvisi)
                 storico[chiave] = record
                 continue
 
@@ -444,9 +457,9 @@ def main():
                   f"{numero_offerte} offerte valide)"
                   + (f"; minimo assoluto {assoluto['prezzo']:.2f}€ ({assoluto['venditore']})" if assoluto else ""))
 
-            controlla_obiettivo(record, nome, chiave, prezzo, obiettivo, dettagli, avvisi)
-            controlla_prezzo_basso(record, nome, chiave, prezzo, prezzi_passati, soglie, dettagli, numero_offerte, avvisi)
-            analisi = controlla_occasione(record, nome, chiave, prezzo, prezzi_offerte, soglie["occasione"], dettagli, avvisi)
+            controlla_obiettivo(record, nome_avviso(riga), chiave, prezzo, obiettivo, dettagli, avvisi)
+            controlla_prezzo_basso(record, nome_avviso(riga), chiave, prezzo, prezzi_passati, soglie, dettagli, numero_offerte, avvisi)
+            analisi = controlla_occasione(record, nome_avviso(riga), chiave, prezzo, prezzi_offerte, soglie["occasione"], dettagli, avvisi)
 
             # Dettaglio dell'offerta migliore, mostrato nell'app
             record["ultimo_dettaglio"] = {
@@ -488,7 +501,7 @@ def main():
                 "q": sum(r[2] for r in ricerche),  # offerte ricevute da CardTrader (diagnostica)
             })
             record["rilevazioni"] = rilevazioni[-MAX_PUNTI_STORICO:]
-            controlla_rialzo(record, nome, chiave, record["rilevazioni"], soglie["rialzo"], avvisi)
+            controlla_rialzo(record, nome_avviso(riga), chiave, record["rilevazioni"], soglie["rialzo"], avvisi)
             storico[chiave] = record
 
         except Exception as e:
@@ -498,7 +511,7 @@ def main():
                 break
             # un problema su una carta non blocca le altre
             print(f"   [errore] problema imprevisto con '{nome}', la salto: {e}")
-            gestisci_fallimento(record, nome, str(e), avvisi)
+            gestisci_fallimento(record, nome_avviso(riga), str(e), avvisi)
             storico[chiave] = record
 
     # Rimuove dallo storico e dalla memoria le carte non più seguite (solo se
