@@ -60,7 +60,7 @@ from common import (
     valuta_prezzo_basso,
     valuta_rialzo,
 )
-from common import CONDIZIONI_VISTE, ESEMPI_FIRMATE, OFFERTE_SCARTATE, condizione_accettata
+from common import CONDIZIONI_VISTE, ESEMPI_FIRMATE, INCOMPLETO, OFFERTE_SCARTATE, RICHIESTE_FALLITE, condizione_accettata
 from mercato import CacheCarte, prezzo_cardmarket
 
 ORE_TRA_PREZZI_CARDMARKET = 6
@@ -343,6 +343,8 @@ def main():
     CONDIZIONI_VISTE.clear()
     OFFERTE_SCARTATE.clear()
     ESEMPI_FIRMATE.clear()
+    RICHIESTE_FALLITE.clear()
+    incomplete = 0
     ct_token = env("CARDTRADER_TOKEN", required=True)
     tg_token = env("TELEGRAM_BOT_TOKEN", "")
     tg_chat_id = env("TELEGRAM_CHAT_ID", "")
@@ -407,6 +409,12 @@ def main():
                 ct_client, nome, riga["lingua"], riga["foil"],
                 riga.get("edizioni_escluse"), riga.get("edizioni_incluse"), cache,
             )
+            if errore and errore.startswith(INCOMPLETO):
+                # non è colpa della carta: salto questo giro senza registrare un prezzo
+                print(f"   {errore[len(INCOMPLETO):]}: salto questo giro per non registrare un minimo sbagliato")
+                incomplete += 1
+                storico[chiave] = record
+                continue
             if errore:
                 print(f"   {errore}")
                 gestisci_fallimento(record, nome, errore, avvisi)
@@ -421,6 +429,7 @@ def main():
             prezzi_offerte = dettagli.pop("prezzi_offerte", [])
             offerte_riferimento = dettagli.pop("offerte_riferimento", [])
             assoluto = dettagli.pop("minimo_assoluto", None)
+            ricerche = dettagli.pop("ricerche", [])
             rilevazioni = record.get("rilevazioni", [])
             prezzi_passati = [r["prezzo"] for r in rilevazioni]
             print(f"   prezzo: {prezzo:.2f}€ ({descrizione_dettagli(dettagli)}, venditore {dettagli.get('venditore')}, "
@@ -453,6 +462,7 @@ def main():
                 "offerte": offerte_riferimento,
                 "sconto": round(analisi["sconto"], 2) if analisi else None,
                 "assoluto": assoluto,
+                "ricerche": ricerche,
                 "product_id": dettagli.get("product_id"),
                 "ultimo_avviso": record.get("ultimo_avviso")
                 if _giorni_fa((record.get("ultimo_avviso") or {}).get("data")) < GIORNI_MEMORIA_AVVISI else None,
@@ -467,6 +477,7 @@ def main():
                 "v": dettagli.get("venditore"),     # chi offriva il prezzo migliore
                 "e": dettagli.get("espansione"),    # di quale edizione
                 "a": assoluto["prezzo"] if assoluto else None,  # minimo anche senza CardTrader Zero
+                "q": sum(r[2] for r in ricerche),  # offerte ricevute da CardTrader (diagnostica)
             })
             record["rilevazioni"] = rilevazioni[-MAX_PUNTI_STORICO:]
             controlla_rialzo(record, nome, chiave, record["rilevazioni"], soglie["rialzo"], avvisi)
@@ -497,6 +508,10 @@ def main():
     meta["condizioni_viste"] = dict(CONDIZIONI_VISTE.most_common())
     meta["offerte_scartate"] = dict(OFFERTE_SCARTATE.most_common())
     meta["esempi_firmate"] = list(ESEMPI_FIRMATE)
+    meta["richieste_fallite"] = dict(RICHIESTE_FALLITE)
+    meta["carte_saltate_risposta_incompleta"] = incomplete
+    if RICHIESTE_FALLITE:
+        print("Ricerche CardTrader fallite:", dict(RICHIESTE_FALLITE), f"- carte saltate: {incomplete}")
     if OFFERTE_SCARTATE:
         print("Offerte scartate:", ", ".join(f"{c} {n}" for c, n in OFFERTE_SCARTATE.most_common()))
     if CONDIZIONI_VISTE:

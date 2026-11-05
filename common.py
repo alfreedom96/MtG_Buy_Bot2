@@ -34,7 +34,10 @@ from collections import Counter
 CONDIZIONI_VISTE = Counter()
 # offerte scartate per motivo (lingua o finitura diverse da quelle chieste, carte firmate o alterate...)
 OFFERTE_SCARTATE = Counter()
-ESEMPI_FIRMATE = []  # valori grezzi visti, per controllare che il filtro sia giusto
+ESEMPI_FIRMATE = []
+# ricerche su CardTrader fallite nell'ultimo controllo, per codice di errore
+RICHIESTE_FALLITE = Counter()
+INCOMPLETO = "INCOMPLETO: "  # prefisso degli errori dovuti a risposte mancanti di CardTrader  # valori grezzi visti, per controllare che il filtro sia giusto
 
 
 def _vero(valore):
@@ -539,14 +542,24 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
     # per il messaggio informativo se non troviamo nulla nelle condizioni richieste
     miglior_altre_condizioni = None
     minimo_assoluto = None  # anche venditori senza CardTrader Zero (solo per il grafico)
+    ricerche = []           # [lingua, foil, numero di offerte ricevute] per ogni ricerca riuscita
+    ricerche_fallite = 0
 
     for blueprint_id in blueprint_ids:
         for lingua in lingue:
             for foil in foils:
                 try:
                     prodotti = ct_client.marketplace_products(blueprint_id, language=lingua, foil=foil)
-                except requests.HTTPError:
+                except requests.RequestException as e:
+                    # Prima questi errori venivano saltati in silenzio: se falliva proprio la
+                    # ricerca con l'offerta più economica, il minimo risultava più alto.
+                    risposta = getattr(e, "response", None)
+                    if risposta is not None and risposta.status_code in (401, 403):
+                        raise
+                    RICHIESTE_FALLITE[str(risposta.status_code) if risposta is not None else "rete"] += 1
+                    ricerche_fallite += 1
                     continue
+                ricerche.append([lingua, foil, len(prodotti)])
                 time.sleep(1.1)  # rate limit: 1 richiesta/sec
 
                 for p in prodotti:
@@ -644,6 +657,10 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
                             "quantita": p.get("quantity"),
                         })
 
+    if ricerche_fallite:
+        # Risposta incompleta: meglio non registrare niente che un minimo sbagliato
+        return None, f"{INCOMPLETO}{ricerche_fallite} ricerche su CardTrader non hanno risposto"
+
     if miglior is None:
         if miglior_altre_condizioni:
             prezzo_alt, condizione_alt = miglior_altre_condizioni
@@ -655,6 +672,7 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
         return None, "nessuna offerta trovata con i filtri richiesti (mercato vuoto)"
 
     miglior[1]["minimo_assoluto"] = minimo_assoluto
+    miglior[1]["ricerche"] = ricerche
     miglior[1]["prezzi_offerte"] = sorted(prezzi_validi)
     miglior[1]["offerte_riferimento"] = sorted(offerte_valide, key=lambda o: o["prezzo"])[:N_OFFERTE_RIFERIMENTO]
     return (miglior[0], miglior[1], numero_offerte_valide), None
