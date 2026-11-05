@@ -407,9 +407,11 @@ def main():
             if cm:
                 print(f"   Cardmarket: {cm[0]:.2f}€ ({cm[1]})")
 
+            ultime = record.get("ultime_offerte") or {}
+            precedenti = ultime.get("offerte") if _giorni_fa(ultime.get("data")) * 1440 <= 40 else None
             risultato, errore = miglior_prezzo(
                 ct_client, nome, riga["lingua"], riga["foil"],
-                riga.get("edizioni_escluse"), riga.get("edizioni_incluse"), cache,
+                riga.get("edizioni_escluse"), riga.get("edizioni_incluse"), cache, precedenti,
             )
             if errore and errore.startswith(INCOMPLETO):
                 # non è colpa della carta: salto questo giro senza registrare un prezzo
@@ -432,6 +434,10 @@ def main():
             offerte_riferimento = dettagli.pop("offerte_riferimento", [])
             assoluto = dettagli.pop("minimo_assoluto", None)
             ricerche = dettagli.pop("ricerche", [])
+            record["ultime_offerte"] = {"data": ora_iso(), "offerte": dettagli.pop("offerte_da_salvare", [])}
+            aggiunte = dettagli.pop("aggiunte_dal_precedente", 0)
+            if aggiunte:
+                print(f"   {aggiunte} offerte prese dal controllo precedente (assenti nella risposta di adesso)")
             rilevazioni = record.get("rilevazioni", [])
             prezzi_passati = [r["prezzo"] for r in rilevazioni]
             print(f"   prezzo: {prezzo:.2f}€ ({descrizione_dettagli(dettagli)}, venditore {dettagli.get('venditore')}, "

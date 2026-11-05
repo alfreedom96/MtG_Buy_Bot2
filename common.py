@@ -533,7 +533,8 @@ def link_pagina_carta(nome_carta, nome_espansione):
     return f"https://www.cardtrader.com/en/cards/{slug}"
 
 
-def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escluse=None, incluse=None, cache=None):
+def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escluse=None, incluse=None, cache=None,
+                   precedenti=None):
     """Cerca il prezzo più basso che rispetta i filtri (condizione Mint/NM/SP,
     CardTrader Zero). Ritorna (risultato, errore):
       - risultato = (prezzo, dettagli, numero_offerte_valide) se trovato
@@ -547,13 +548,9 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
     lingue = lingue_da_controllare(lingua_richiesta)
     foils = foil_da_controllare(foil_richiesto)
 
-    miglior = None  # (prezzo_eur, dettagli)
-    numero_offerte_valide = 0
-    prezzi_validi = []
-    offerte_valide = []  # dettagli di ogni offerta valida, per mostrarle nell'app
+    raccolte = []  # tutte le offerte valide (con e senza CardTrader Zero)
     # per il messaggio informativo se non troviamo nulla nelle condizioni richieste
     miglior_altre_condizioni = None
-    minimo_assoluto = None  # anche venditori senza CardTrader Zero (solo per il grafico)
     ricerche = []           # [lingua, foil, numero di offerte ricevute] per ogni ricerca riuscita
     ricerche_fallite = 0
 
@@ -630,50 +627,35 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
                             miglior_altre_condizioni = (prezzo, condizione)
                         continue
 
-                    # minimo assoluto: tutti i venditori, con o senza CardTrader Zero
-                    if minimo_assoluto is None or prezzo < minimo_assoluto["prezzo"]:
-                        minimo_assoluto = {
-                            "prezzo": prezzo,
-                            "venditore": user.get("username"),
-                            "espansione": exp.get("name_en"),
-                            "ct_zero": ct_zero,
-                        }
-
-                    if not ct_zero:
-                        continue  # per acquisto e avvisi serve CardTrader Zero
-
-                    numero_offerte_valide += 1
-                    prezzi_validi.append(prezzo)
-                    offerte_valide.append({
+                    prezzo_nativo = p.get("price", {}) or {}
+                    raccolte.append({
                         "prezzo": prezzo,
                         "condizione": condizione,
                         "lingua": lingua_reale,
                         "foil": bool(foil_reale),
                         "product_id": p.get("id"),
-                        "espansione": p.get("expansion", {}).get("name_en"),
+                        "blueprint_id": blueprint_id,
+                        "espansione": exp.get("name_en"),
                         "venditore": user.get("username"),
                         "quantita": p.get("quantity"),
+                        "ct_zero": ct_zero,
+                        "prezzo_nativo": f"{prezzo_nativo.get('cents', 0) / 100:.2f} {prezzo_nativo.get('currency', '?')}"
+                        if prezzo_nativo else None,
                     })
-                    if miglior is None or prezzo < miglior[0]:
-                        prezzo_nativo = p.get("price", {})
-                        miglior = (prezzo, {
-                            "condizione": condizione,
-                            "lingua": lingua_reale,
-                            "foil": bool(foil_reale),
-                            "espansione": p.get("expansion", {}).get("name_en"),
-                            "venditore": user.get("username"),
-                            "product_id": p.get("id"),
-                            "blueprint_id": blueprint_id,
-                            "prezzo_nativo": f"{prezzo_nativo.get('cents', 0) / 100:.2f} {prezzo_nativo.get('currency', '?')}"
-                            if prezzo_nativo else None,
-                            "quantita": p.get("quantity"),
-                        })
 
     if ricerche_fallite:
         # Risposta incompleta: meglio non registrare niente che un minimo sbagliato
         return None, f"{INCOMPLETO}{ricerche_fallite} ricerche su CardTrader non hanno risposto"
 
-    if miglior is None:
+    # Unione con le offerte del controllo precedente: CardTrader risponde con due
+    # versioni del mercato non allineate, in ognuna delle quali mancano offerte
+    # diverse. Le offerte viste nel giro prima (e non in questo) restano valide
+    # per un controllo; se un'offerta c'è in entrambi vale il prezzo di adesso.
+    ids_ora = {o["product_id"] for o in raccolte}
+    dal_precedente = [dict(o, dal_controllo_precedente=True) for o in (precedenti or [])
+                      if o.get("product_id") not in ids_ora]
+    risultato = riassumi_offerte(raccolte + dal_precedente)
+    if risultato is None:
         if miglior_altre_condizioni:
             prezzo_alt, condizione_alt = miglior_altre_condizioni
             return None, (
@@ -682,12 +664,38 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
                 f"(non considerata per l'acquisto)"
             )
         return None, "nessuna offerta trovata con i filtri richiesti (mercato vuoto)"
+    prezzo, dettagli, numero = risultato
+    dettagli["ricerche"] = ricerche
+    dettagli["aggiunte_dal_precedente"] = len(dal_precedente)
+    # da salvare per il prossimo giro: solo quelle viste ADESSO (così un'offerta
+    # sparita resta al massimo un controllo in più), le 40 più economiche
+    dettagli["offerte_da_salvare"] = sorted(raccolte, key=lambda o: o["prezzo"])[:40]
+    return (prezzo, dettagli, numero), None
 
-    miglior[1]["minimo_assoluto"] = minimo_assoluto
-    miglior[1]["ricerche"] = ricerche
-    miglior[1]["prezzi_offerte"] = sorted(prezzi_validi)
-    miglior[1]["offerte_riferimento"] = sorted(offerte_valide, key=lambda o: o["prezzo"])[:N_OFFERTE_RIFERIMENTO]
-    return (miglior[0], miglior[1], numero_offerte_valide), None
+
+def riassumi_offerte(offerte):
+    """Dall'elenco delle offerte valide (condizione, lingua, finitura già
+    verificate) calcola prezzo minimo con CardTrader Zero, dettagli dell'offerta
+    migliore, minimo assoluto (tutti i venditori) e le 10 più economiche."""
+    zero = sorted((o for o in offerte if o.get("ct_zero")), key=lambda o: o["prezzo"])
+    if not zero:
+        return None
+    m = zero[0]
+    tutte = min(offerte, key=lambda o: o["prezzo"])
+    dettagli = {
+        "condizione": m["condizione"], "lingua": m["lingua"], "foil": m["foil"],
+        "espansione": m["espansione"], "venditore": m["venditore"], "product_id": m["product_id"],
+        "blueprint_id": m.get("blueprint_id"), "prezzo_nativo": m.get("prezzo_nativo"), "quantita": m.get("quantita"),
+        "minimo_assoluto": {"prezzo": tutte["prezzo"], "venditore": tutte["venditore"],
+                            "espansione": tutte["espansione"], "ct_zero": bool(tutte.get("ct_zero"))},
+        "prezzi_offerte": [o["prezzo"] for o in zero],
+        "offerte_riferimento": [
+            {k: o.get(k) for k in ("prezzo", "condizione", "lingua", "foil", "product_id", "espansione",
+                                   "venditore", "quantita", "dal_controllo_precedente") if o.get(k) is not None}
+            for o in zero[:N_OFFERTE_RIFERIMENTO]
+        ],
+    }
+    return m["prezzo"], dettagli, len(zero)
 
 
 def valuta_prezzo_basso(prezzi_passati, prezzo, soglia_percentile, soglia_ribasso):
