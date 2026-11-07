@@ -61,6 +61,7 @@ SOGLIA_FALLIMENTI_CONSECUTIVI = 10  # dopo quanti fallimenti di fila avvisare
 N_OFFERTE_RIFERIMENTO = 10  # occasione: confronto con la media delle N offerte più economiche
 FATTORE_FUORI_SCALA = 1.5  # occasione: escluse le offerte oltre 1,5 volte la mediana delle 10 più economiche
 SOGLIA_RIBASSO_PREDEFINITA = 5.0
+INTERVALLO_MERCATO = 0.25  # secondi tra due richieste al mercato: il limite reale è 10 al secondo (verificato il 7/11/2026), ne uso 4
 ORE_MEMORIA_OFFERTE = 2  # offerte non restituite da CardTrader restano valide per 2 ore
 SOGLIA_RIALZO_PREDEFINITA = 15.0  # avviso impennata: +15% ...
 GIORNI_RIALZO = 3                 # ... rispetto ai 3 giorni precedenti
@@ -339,12 +340,32 @@ class CardTraderClient:
             params["language"] = language
         if foil is not None:
             params["foil"] = str(foil).lower()
+        self._rispetta_limite()
         data = self._get("/marketplace/products", params=params, fresco=True)
         # la risposta è {blueprint_id: [prodotti]}
         prodotti = []
         for lista in data.values():
             prodotti.extend(lista)
         return prodotti
+
+    def _rispetta_limite(self):
+        """Distanzia le richieste al mercato di almeno INTERVALLO_MERCATO secondi
+        (limite di CardTrader). Aspetta solo il tempo che manca davvero."""
+        ultima = getattr(self, "_ultima_richiesta_mercato", 0.0)
+        attesa = ultima + INTERVALLO_MERCATO - time.time()
+        if attesa > 0:
+            time.sleep(attesa)
+        self._ultima_richiesta_mercato = time.time()
+
+    def offerte_blueprint(self, blueprint_id, rileggi=False):
+        """Tutte le offerte di una scheda prodotto (ogni lingua e finitura) con
+        una sola richiesta. Nello stesso giro la risposta viene riusata dalle
+        altre varianti della stessa carta; rileggi=True la chiede di nuovo."""
+        if not hasattr(self, "_offerte_cache"):
+            self._offerte_cache = {}
+        if rileggi or blueprint_id not in self._offerte_cache:
+            self._offerte_cache[blueprint_id] = self.marketplace_products(blueprint_id)
+        return self._offerte_cache[blueprint_id]
 
 
 # ---------------------------------------------------------------------------
@@ -556,94 +577,88 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
     ricerche_fallite = 0
 
     for blueprint_id in blueprint_ids:
-        for lingua in lingue:
-            for foil in foils:
-                try:
-                    prodotti = ct_client.marketplace_products(blueprint_id, language=lingua, foil=foil)
-                except requests.RequestException as e:
-                    # Prima questi errori venivano saltati in silenzio: se falliva proprio la
-                    # ricerca con l'offerta più economica, il minimo risultava più alto.
-                    risposta = getattr(e, "response", None)
-                    if risposta is not None and risposta.status_code in (401, 403):
-                        raise
-                    RICHIESTE_FALLITE[str(risposta.status_code) if risposta is not None else "rete"] += 1
-                    ricerche_fallite += 1
+        try:
+            prodotti = ct_client.offerte_blueprint(blueprint_id)
+        except requests.RequestException as e:
+            # Se fallisce proprio la ricerca con l'offerta più economica il minimo
+            # risulterebbe più alto: in quel caso la carta viene saltata.
+            risposta = getattr(e, "response", None)
+            if risposta is not None and risposta.status_code in (401, 403):
+                raise
+            RICHIESTE_FALLITE[str(risposta.status_code) if risposta is not None else "rete"] += 1
+            ricerche_fallite += 1
+            continue
+        ricerche.append(["tutte", "tutte", len(prodotti)])
+
+        for p in prodotti:
+            props = p.get("properties_hash", {}) or {}
+            # Una sola richiesta per tutte le lingue e finiture: tengo solo quelle richieste
+            lingua_reale = str(props.get("mtg_language") or "").lower()
+            if lingua_reale not in lingue:
+                continue
+            foil_reale = _vero(props.get("mtg_foil"))
+            if foil_reale not in foils:
+                continue
+            user = p.get("user", {})
+            if user.get("on_vacation"):
+                continue
+            ct_zero = bool(user.get("can_sell_via_hub"))
+
+            exp = p.get("expansion") or {}
+            exp_ids = {x for x in (_norm_edizione(exp.get("code") or ""),
+                                   _norm_edizione(exp.get("name_en") or "")) if x}
+            if exp_ids:
+                if escluse and exp_ids & set(escluse):
                     continue
-                ricerche.append([lingua, foil, len(prodotti)])
-                time.sleep(1.1)  # rate limit: 1 richiesta/sec
+                if incluse and not (exp_ids & set(incluse)):
+                    continue
 
-                for p in prodotti:
-                    user = p.get("user", {})
-                    if user.get("on_vacation"):
-                        continue
-                    ct_zero = bool(user.get("can_sell_via_hub"))
+            prezzo_cents = p.get("price_cents")
+            valuta = p.get("price_currency")
+            if prezzo_cents is None or valuta is None:
+                # fallback: alcune risposte potrebbero non avere i
+                # campi convertiti, usiamo il prezzo nativo del venditore
+                prezzo_cents = p["price"]["cents"]
+                valuta = p["price"]["currency"]
+            if valuta != "EUR":
+                continue  # per semplicità confrontiamo solo prezzi in EUR
+            prezzo = prezzo_cents / 100.0
 
-                    exp = p.get("expansion") or {}
-                    exp_ids = {x for x in (_norm_edizione(exp.get("code") or ""),
-                                           _norm_edizione(exp.get("name_en") or "")) if x}
-                    if exp_ids:
-                        if escluse and exp_ids & set(escluse):
-                            continue
-                        if incluse and not (exp_ids & set(incluse)):
-                            continue
+            condizione = props.get("condition")
+            CONDIZIONI_VISTE[str(condizione)] += 1
 
-                    prezzo_cents = p.get("price_cents")
-                    valuta = p.get("price_currency")
-                    if prezzo_cents is None or valuta is None:
-                        # fallback: alcune risposte potrebbero non avere i
-                        # campi convertiti, usiamo il prezzo nativo del venditore
-                        prezzo_cents = p["price"]["cents"]
-                        valuta = p["price"]["currency"]
-                    if valuta != "EUR":
-                        continue  # per semplicità confrontiamo solo prezzi in EUR
-                    prezzo = prezzo_cents / 100.0
+            if _vero(props.get("signed")) or _vero(props.get("altered")):
+                OFFERTE_SCARTATE["firmata o alterata"] += 1
+                if len(ESEMPI_FIRMATE) < 3:
+                    ESEMPI_FIRMATE.append({"signed": props.get("signed"), "altered": props.get("altered"),
+                                           "product_id": p.get("id")})
+                continue
+            if user.get("too_many_request_for_cancel_as_seller"):
+                OFFERTE_SCARTATE["venditore con troppi ordini annullati"] += 1
+                continue
 
-                    props = p.get("properties_hash", {}) or {}
-                    condizione = props.get("condition")
-                    CONDIZIONI_VISTE[str(condizione)] += 1
+            if not condizione_accettata(condizione):
+                # non valido per l'acquisto, ma lo teniamo per l'informazione
+                if ct_zero and (miglior_altre_condizioni is None or prezzo < miglior_altre_condizioni[0]):
+                    miglior_altre_condizioni = (prezzo, condizione)
+                continue
 
-                    # Controlli sui dati reali dell'offerta: non mi fido solo dei
-                    # filtri della ricerca (lingua, foil), li verifico prodotto per prodotto
-                    lingua_reale = str(props.get("mtg_language") or lingua or "").lower()
-                    if lingua_reale and lingua_reale not in lingue:
-                        OFFERTE_SCARTATE["lingua diversa"] += 1
-                        continue
-                    foil_reale = props.get("mtg_foil", foil)
-                    if foil_reale is not None and bool(foil_reale) != bool(foil):
-                        OFFERTE_SCARTATE["finitura diversa"] += 1
-                        continue
-                    if _vero(props.get("signed")) or _vero(props.get("altered")):
-                        OFFERTE_SCARTATE["firmata o alterata"] += 1
-                        if len(ESEMPI_FIRMATE) < 3:
-                            ESEMPI_FIRMATE.append({"signed": props.get("signed"), "altered": props.get("altered"),
-                                                   "product_id": p.get("id")})
-                        continue
-                    if user.get("too_many_request_for_cancel_as_seller"):
-                        OFFERTE_SCARTATE["venditore con troppi ordini annullati"] += 1
-                        continue
-
-                    if not condizione_accettata(condizione):
-                        # non valido per l'acquisto, ma lo teniamo per l'informazione
-                        if ct_zero and (miglior_altre_condizioni is None or prezzo < miglior_altre_condizioni[0]):
-                            miglior_altre_condizioni = (prezzo, condizione)
-                        continue
-
-                    prezzo_nativo = p.get("price", {}) or {}
-                    raccolte.append({
-                        "visto": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "prezzo": prezzo,
-                        "condizione": condizione,
-                        "lingua": lingua_reale,
-                        "foil": bool(foil_reale),
-                        "product_id": p.get("id"),
-                        "blueprint_id": blueprint_id,
-                        "espansione": exp.get("name_en"),
-                        "venditore": user.get("username"),
-                        "quantita": p.get("quantity"),
-                        "ct_zero": ct_zero,
-                        "prezzo_nativo": f"{prezzo_nativo.get('cents', 0) / 100:.2f} {prezzo_nativo.get('currency', '?')}"
-                        if prezzo_nativo else None,
-                    })
+            prezzo_nativo = p.get("price", {}) or {}
+            raccolte.append({
+                "visto": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "prezzo": prezzo,
+                "condizione": condizione,
+                "lingua": lingua_reale,
+                "foil": bool(foil_reale),
+                "product_id": p.get("id"),
+                "blueprint_id": blueprint_id,
+                "espansione": exp.get("name_en"),
+                "venditore": user.get("username"),
+                "quantita": p.get("quantity"),
+                "ct_zero": ct_zero,
+                "prezzo_nativo": f"{prezzo_nativo.get('cents', 0) / 100:.2f} {prezzo_nativo.get('currency', '?')}"
+                if prezzo_nativo else None,
+            })
 
     if ricerche_fallite:
         # Risposta incompleta: meglio non registrare niente che un minimo sbagliato

@@ -172,6 +172,9 @@ def aggiorna_cardmarket(record, stampe, riga):
 GIORNI_MEMORIA_AVVISI = 7
 
 
+MINUTI_TRA_PUNTI = 14
+
+
 def _giorni_fa(iso):
     try:
         t = datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
@@ -272,10 +275,29 @@ def controlla_prezzo_basso(record, nome, chiave, prezzo, prezzi_passati, soglie,
         print("   -> avviso PREZZO BASSO inviato")
 
 
-def controlla_occasione(record, nome, chiave, prezzo, prezzi_offerte, soglia, dettagli, avvisi):
+def riconferma_offerta(ct_client, dettagli, prezzo, attesa=10):
+    """Richiede di nuovo, dopo qualche secondo, la scheda prodotto dell'offerta:
+    True se l'offerta c'è ancora allo stesso prezzo (o più basso)."""
+    pid, bp = dettagli.get("product_id"), dettagli.get("blueprint_id")
+    if pid is None or bp is None:
+        return False
+    time.sleep(attesa)
+    try:
+        prodotti = ct_client.offerte_blueprint(bp, rileggi=True)
+    except requests.RequestException:
+        return False
+    for p in prodotti:
+        if p.get("id") == pid:
+            cents = p.get("price_cents")
+            return cents is not None and cents / 100 <= prezzo + 0.005
+    return False
+
+
+def controlla_occasione(record, nome, chiave, prezzo, prezzi_offerte, soglia, dettagli, avvisi, riconferma=None):
     """🔥 Occasione. Per evitare avvisi ripetuti o su offerte "fantasma":
-      - l'offerta deve essere la più economica in due controlli di fila
-        (un'offerta che compare e sparisce subito non conta);
+      - l'offerta deve essere confermata: o da una seconda richiesta fatta
+        subito dopo qualche secondo, o (se quella non la trova) dal controllo
+        successivo;
       - la stessa offerta non viene segnalata di nuovo per 7 giorni,
         anche se nel frattempo sparisce e ricompare."""
     analisi = analizza_occasione(prezzi_offerte, soglia)
@@ -296,8 +318,11 @@ def controlla_occasione(record, nome, chiave, prezzo, prezzi_offerte, soglia, de
     candidata = record.get("occasione_candidata")
     record["occasione_candidata"] = pid
     if candidata != pid:
-        print("   occasione da confermare al prossimo controllo")
-        return analisi
+        if riconferma is not None and riconferma():
+            print("   occasione confermata da una seconda richiesta immediata")
+        else:
+            print("   occasione da confermare al prossimo controllo")
+            return analisi
     notificate = {k: v for k, v in (record.get("occasioni_notificate") or {}).items()
                   if _giorni_fa(v) < GIORNI_MEMORIA_AVVISI}
     record["occasioni_notificate"] = notificate
@@ -467,7 +492,8 @@ def main():
             else:
                 controlla_obiettivo(record, nome_avviso(riga), chiave, prezzo, obiettivo, dettagli, avvisi)
                 controlla_prezzo_basso(record, nome_avviso(riga), chiave, prezzo, prezzi_passati, soglie, dettagli, numero_offerte, avvisi)
-                analisi = controlla_occasione(record, nome_avviso(riga), chiave, prezzo, prezzi_offerte, soglie["occasione"], dettagli, avvisi)
+                analisi = controlla_occasione(record, nome_avviso(riga), chiave, prezzo, prezzi_offerte, soglie["occasione"], dettagli, avvisi,
+                                              riconferma=lambda: riconferma_offerta(ct_client, dettagli, prezzo))
 
             # Dettaglio dell'offerta migliore, mostrato nell'app
             record["ultimo_dettaglio"] = {
@@ -499,7 +525,7 @@ def main():
                 if _giorni_fa((record.get("ultima_occasione_info") or {}).get("data")) < GIORNI_MEMORIA_AVVISI else None,
             }
 
-            rilevazioni.append({
+            punto = {
                 "data": ora_iso(),
                 "prezzo": prezzo,
                 # chiavi corte: il file ha migliaia di righe
@@ -507,7 +533,15 @@ def main():
                 "e": dettagli.get("espansione"),    # di quale edizione
                 "a": assoluto["prezzo"] if assoluto else None,  # minimo anche senza CardTrader Zero
                 "q": sum(r[2] for r in ricerche),  # offerte ricevute da CardTrader (diagnostica)
-            })
+            }
+            # Con controlli ogni pochi minuti lo storico si riempirebbe troppo in fretta:
+            # al massimo un punto ogni MINUTI_TRA_PUNTI. Se l'ultimo è più recente lo
+            # aggiorno con il prezzo attuale (tenendo la sua ora).
+            if rilevazioni and _giorni_fa(rilevazioni[-1].get("data")) * 1440 < MINUTI_TRA_PUNTI:
+                punto["data"] = rilevazioni[-1]["data"]
+                rilevazioni[-1] = punto
+            else:
+                rilevazioni.append(punto)
             record["rilevazioni"] = rilevazioni[-MAX_PUNTI_STORICO:]
             controlla_rialzo(record, nome_avviso(riga), chiave, record["rilevazioni"], soglie["rialzo"], avvisi)
             storico[chiave] = record
