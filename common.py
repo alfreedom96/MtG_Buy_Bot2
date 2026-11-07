@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Modulo condiviso da check_prices.py, send_digest.py e bot_commands.py.
+Funzioni usate da check_prices.py.
 Contiene: accesso alle API di CardTrader e Scryfall, gestione dello
 storico prezzi, calcoli statistici e invio messaggi/foto Telegram.
 """

@@ -52,12 +52,11 @@ anche cancellando il file oggi resterebbe nei commit passati).
 
 - `common.py` — funzioni condivise (API CardTrader/Scryfall, storico, Telegram).
 - `check_prices.py` — controllo prezzi, eseguito ogni ora.
-- `send_digest.py` — riepilogo di tutte le carte, eseguito ogni settimana (e disponibile a comando).
-- `bot_commands.py` — ascolta i comandi che scrivi al bot (`/grafico`, `/riepilogo`, `/help`).
-- `cloudflare_worker.js` — codice del ponte Telegram → GitHub per risposte istantanee ai comandi.
-- tre workflow in `.github/workflows/` che eseguono gli script sopra,
-  ciascuno dei quali scarica anche il repository dati privato in `data/`
-  prima di partire.
+- `cloudflare_worker.js` — il Worker da incollare su Cloudflare (app + sue API).
+- `.github/workflows/check_prices.yml` — esegue il controllo; scarica anche
+  il repository dati privato in `data/` prima di partire.
+
+Gli avvisi arrivano solo come notifiche dell'app (il bot Telegram è stato dismesso).
 
 - `pwa/` — l'app per il telefono (PWA, Progressive Web App): `index.html`, `app.js`, service worker, icone.
 - `worker/worker_src.js` — sorgente del Cloudflare Worker (API dell'app + webhook Telegram).

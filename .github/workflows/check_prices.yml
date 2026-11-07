@@ -4,7 +4,7 @@ on:
   schedule:
     # Rete di sicurezza: lo scheduler interno di GitHub non è affidabile
     # per intervalli brevi, quindi il trigger principale ora è esterno
-    # (cron-job.org chiama direttamente workflow_dispatch ogni ora). Questo
+    # (cron-job.org chiama direttamente workflow_dispatch ogni pochi minuti). Questo
     # schedule più rado resta solo come backup in caso il servizio esterno
     # smetta di funzionare.
     - cron: "0 */4 * * *"
@@ -41,8 +41,6 @@ jobs:
       - name: Esegui controllo prezzi
         env:
           CARDTRADER_TOKEN: ${{ secrets.CARDTRADER_TOKEN }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SHEET_CSV_URL: ${{ secrets.SHEET_CSV_URL }}
           # Se impostati, la lista carte viene letta dall'app invece che dal foglio
           WORKER_URL: ${{ secrets.WORKER_URL }}
