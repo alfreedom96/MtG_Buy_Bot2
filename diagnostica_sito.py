@@ -1,19 +1,28 @@
-"""Diagnostica una tantum: confronta ciò che mostra il sito CardTrader con
-ciò che restituisce l'API per Vault of Champions (Commander: Star Trek)."""
-import gzip, json, os, time, requests
+"""Diagnostica una tantum: l'API restituisce dati diversi chiedendo per
+espansione invece che per scheda? E ripetendo la richiesta nel tempo?"""
+import json, os, time, requests
 H = {"Authorization": f"Bearer {os.environ['CARDTRADER_TOKEN']}"}
-out = {"ora": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-r = requests.get("https://api.cardtrader.com/api/v2/marketplace/products", headers=H,
-                 params={"blueprint_id": 420697}, timeout=30)
-out["api_stato"] = r.status_code
-out["api"] = r.json()
-for url in ["https://www.cardtrader.com/en/cards/vault-of-champions-commander-star-trek",
-            "https://www.cardtrader.com/it/cards/vault-of-champions-commander-star-trek"]:
-    try:
-        s = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130 Safari/537.36",
-                                       "Accept-Language": "en"}, timeout=30)
-        out.setdefault("sito", []).append({"url": url, "stato": s.status_code, "finale": s.url, "lunghezza": len(s.text)})
-        open("data/diag_sito_%s.html.gz" % url.split("/")[3], "wb").write(gzip.compress(s.content))
-    except requests.RequestException as e:
-        out.setdefault("sito", []).append({"url": url, "errore": str(e)})
-json.dump(out, open("data/diag_sito.json", "w"), ensure_ascii=False)
+U = "https://api.cardtrader.com/api/v2/marketplace/products"
+VENDITORI = ("Packfresh", "Selvi54tcg", "Hometown Games", "Ventura Games", "Topdeck Hero Boucherville",
+             "Dobi-trading", "Magic Stronghold", "Alphastrikegames")
+def estrai(data):
+    out = []
+    for bp, lista in data.items():
+        for p in lista:
+            if str(p.get("blueprint_id")) == "420697" or str(bp) == "420697":
+                u = p["user"]["username"]
+                if u in VENDITORI:
+                    out.append([u, p["id"], p["price_cents"], p["quantity"], (p.get("properties_hash") or {}).get("mtg_language")])
+    return sorted(out)
+out = {}
+for i in range(3):
+    r = requests.get(U, headers=H, params={"blueprint_id": 420697}, timeout=30)
+    out[f"scheda_{i}"] = {"ora": time.strftime("%H:%M:%S"), "stato": r.status_code, "offerte": estrai(r.json()),
+                          "intestazioni": dict(r.headers)}
+    time.sleep(2)
+r = requests.get(U, headers=H, params={"expansion_id": 4661}, timeout=60)
+out["espansione"] = {"ora": time.strftime("%H:%M:%S"), "stato": r.status_code,
+                     "offerte": estrai(r.json()) if r.ok else r.text[:300], "intestazioni": dict(r.headers)}
+r = requests.get(U, headers=H, params={"blueprint_id": 420697, "language": "en"}, timeout=30)
+out["scheda_en"] = {"stato": r.status_code, "offerte": estrai(r.json())}
+json.dump(out, open("data/diag_sito.json", "w"), ensure_ascii=False, indent=1)
