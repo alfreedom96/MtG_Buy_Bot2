@@ -357,15 +357,21 @@ class CardTraderClient:
             time.sleep(attesa)
         self._ultima_richiesta_mercato = time.time()
 
-    def offerte_blueprint(self, blueprint_id, rileggi=False):
-        """Tutte le offerte di una scheda prodotto (ogni lingua e finitura) con
-        una sola richiesta. Nello stesso giro la risposta viene riusata dalle
-        altre varianti della stessa carta; rileggi=True la chiede di nuovo."""
+    def offerte_blueprint(self, blueprint_id, lingue=("it", "en"), rileggi=False):
+        """Offerte di una scheda prodotto nelle lingue indicate (ogni finitura):
+        una richiesta per lingua. Nello stesso giro la risposta viene riusata
+        dalle altre varianti della stessa carta; rileggi=True la chiede di nuovo.
+        La richiesta senza filtro di lingua NON va usata: CardTrader la serve da
+        una copia in memoria (cache) che può essere vecchia di molte ore."""
         if not hasattr(self, "_offerte_cache"):
             self._offerte_cache = {}
-        if rileggi or blueprint_id not in self._offerte_cache:
-            self._offerte_cache[blueprint_id] = self.marketplace_products(blueprint_id)
-        return self._offerte_cache[blueprint_id]
+        prodotti = []
+        for lingua in lingue:
+            chiave = (blueprint_id, lingua)
+            if rileggi or chiave not in self._offerte_cache:
+                self._offerte_cache[chiave] = self.marketplace_products(blueprint_id, language=lingua)
+            prodotti.extend(self._offerte_cache[chiave])
+        return prodotti
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +584,7 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
 
     for blueprint_id in blueprint_ids:
         try:
-            prodotti = ct_client.offerte_blueprint(blueprint_id)
+            prodotti = ct_client.offerte_blueprint(blueprint_id, lingue)
         except requests.RequestException as e:
             # Se fallisce proprio la ricerca con l'offerta più economica il minimo
             # risulterebbe più alto: in quel caso la carta viene saltata.
@@ -588,7 +594,7 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
             RICHIESTE_FALLITE[str(risposta.status_code) if risposta is not None else "rete"] += 1
             ricerche_fallite += 1
             continue
-        ricerche.append(["tutte", "tutte", len(prodotti)])
+        ricerche.append(["+".join(lingue), "tutte", len(prodotti)])
 
         for p in prodotti:
             props = p.get("properties_hash", {}) or {}

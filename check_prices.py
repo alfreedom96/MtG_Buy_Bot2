@@ -283,7 +283,7 @@ def riconferma_offerta(ct_client, dettagli, prezzo, attesa=10):
         return False
     time.sleep(attesa)
     try:
-        prodotti = ct_client.offerte_blueprint(bp, rileggi=True)
+        prodotti = ct_client.offerte_blueprint(bp, (dettagli.get("lingua") or "en",), rileggi=True)
     except requests.RequestException:
         return False
     for p in prodotti:
