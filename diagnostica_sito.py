@@ -1,33 +1,30 @@
-"""Diagnostica una tantum: un parametro in più aggira la cache dell'API?"""
-import json, os, time, requests
+"""Diagnostica una tantum: dopo quanto tempo la cache dell'API CardTrader si
+rinnova, e se si allunga a ogni richiesta (scadenza "scorrevole")."""
+import hashlib, json, os, time, requests
 H = {"Authorization": f"Bearer {os.environ['CARDTRADER_TOKEN']}"}
 U = "https://api.cardtrader.com/api/v2/marketplace/products"
-def sintesi(data):
-    ps = [p for l in data.values() for p in l]
-    pk = {p["user"]["username"]: (p["id"], p["price_cents"], p["quantity"]) for p in ps
-          if p["user"]["username"] in ("Packfresh", "Selvi54tcg", "Ventura Games", "Hometown Games")}
-    return {"n": len(ps), "venditori": pk}
-out = {"giri": []}
-for giro in range(2):
-    ts = int(time.time() * 1000)
-    varianti = {
-        "senza_filtri": {"blueprint_id": 420697},
-        "underscore": {"blueprint_id": 420697, "_": ts},
-        "t": {"blueprint_id": 420697, "t": ts},
-        "nocache": {"blueprint_id": 420697, "nocache": ts},
-        "con_espansione": {"blueprint_id": 420697, "expansion_id": 4661},
-        "espansione_sola": {"expansion_id": 4661},
-    }
-    for nome, params in varianti.items():
-        r = requests.get(U, headers=H, params=params, timeout=60)
-        j = r.json() if r.ok else {}
-        if nome == "espansione_sola":
-            j = {k: v for k, v in j.items() if str(k) == "420697"}
-        out["giri"].append({"giro": giro, "ora": time.strftime("%H:%M:%S"), "variante": nome, "stato": r.status_code,
-                            "runtime": r.headers.get("x-runtime"), **(sintesi(j) if r.ok else {"testo": r.text[:200]})})
-        if giro == 0 and nome == "t" and r.ok:
-            ps = [p for l in j.values() for p in l]
-            out["esempio_prodotto"] = ps[0] if ps else None
-        time.sleep(0.5)
-    time.sleep(20)
-json.dump(out, open("data/diag_sito.json", "w"), ensure_ascii=False, indent=1)
+BP = [23962, 13700, 23490]
+# (nome, parametri extra, ogni quanti minuti)
+CHIAVI = [("EN_nf_1min", {"language": "EN", "foil": "false"}, 1),
+          ("EN_f_5min", {"language": "EN", "foil": "true"}, 5),
+          ("IT_nf_10min", {"language": "IT", "foil": "false"}, 10),
+          ("IT_f_20min", {"language": "IT", "foil": "true"}, 20),
+          ("senza_filtri_1min", {}, 1)]
+log = []
+inizio = time.time()
+for minuto in range(0, 61):
+    for nome, extra, ogni in CHIAVI:
+        if minuto % ogni:
+            continue
+        for bp in BP:
+            r = requests.get(U, headers=H, params={"blueprint_id": bp, **extra}, timeout=30)
+            if not r.ok:
+                log.append({"m": minuto, "k": nome, "bp": bp, "stato": r.status_code}); continue
+            ps = sorted((p["id"], p["price_cents"], p["quantity"]) for l in r.json().values() for p in l)
+            log.append({"m": minuto, "k": nome, "bp": bp, "rt": float(r.headers.get("x-runtime") or 0),
+                        "n": len(ps), "h": hashlib.md5(json.dumps(ps).encode()).hexdigest()[:8]})
+            time.sleep(0.3)
+    json.dump(log, open("data/diag_cache.json", "w"))
+    attesa = inizio + (minuto + 1) * 60 - time.time()
+    if attesa > 0:
+        time.sleep(attesa)

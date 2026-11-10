@@ -2,7 +2,7 @@ name: Diagnostica sito contro API
 on:
   workflow_dispatch: {}
 concurrency:
-  group: check-prices
+  group: diagnostica
   cancel-in-progress: false
 jobs:
   diagnostica:
@@ -26,6 +26,6 @@ jobs:
           cd data
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add diag_sito* || exit 0
+          git add diag_* || exit 0
           git diff --quiet --cached || git commit -m "Diagnostica sito [skip ci]"
           for i in 1 2 3 4 5; do git pull --rebase origin main && git push && break; sleep 5; done
