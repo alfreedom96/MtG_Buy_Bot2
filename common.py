@@ -61,7 +61,7 @@ SOGLIA_FALLIMENTI_CONSECUTIVI = 10  # dopo quanti fallimenti di fila avvisare
 N_OFFERTE_RIFERIMENTO = 10  # occasione: confronto con la media delle N offerte più economiche
 FATTORE_FUORI_SCALA = 1.5  # occasione: escluse le offerte oltre 1,5 volte la mediana delle 10 più economiche
 SOGLIA_RIBASSO_PREDEFINITA = 5.0
-INTERVALLO_MERCATO = 0.17  # secondi tra due richieste al mercato: il limite reale è 10 al secondo (verificato il 7/11/2026), ne uso 6
+INTERVALLO_MERCATO = 0.5  # secondi tra due richieste al mercato (2 al secondo): carico ridotto dopo il blocco dell'11/11/2026
 ORE_MEMORIA_OFFERTE = 2  # offerte non restituite da CardTrader restano valide per 2 ore
 SOGLIA_RIALZO_PREDEFINITA = 15.0  # avviso impennata: +15% ...
 GIORNI_RIALZO = 3                 # ... rispetto ai 3 giorni precedenti
@@ -384,16 +384,10 @@ class CardTraderClient:
                 if str((p.get("properties_hash") or {}).get("mtg_language") or "").lower() in lingue:
                     out.append(p)
             return out
-        candidati = {
-            "lingua": nelle_lingue([p for l in lingue for p in self._richiesta(blueprint_id, rileggi, language=l)]),
-            "finitura": nelle_lingue([p for f in (True, False) for p in self._richiesta(blueprint_id, rileggi, foil=f)]),
-            "senza_filtri": nelle_lingue(self._richiesta(blueprint_id, rileggi)),
-        }
-        def recente(nome):
-            return max((p.get("id") or 0 for p in candidati[nome]), default=0)
-        scelta = max(candidati, key=lambda n: (recente(n), n == "lingua"))
-        self.ultima_scelta = scelta
-        return candidati[scelta]
+        # Solo le richieste per lingua: meno carico sui server di CardTrader
+        # (dall'11/11/2026 bloccano le richieste dai server di GitHub).
+        self.ultima_scelta = "lingua"
+        return nelle_lingue([p for l in lingue for p in self._richiesta(blueprint_id, rileggi, language=l)])
 
 
 # ---------------------------------------------------------------------------
