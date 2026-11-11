@@ -96,6 +96,21 @@ def token_rifiutato(errore):
     )
 
 
+def bloccato_da_cloudflare(errore):
+    """403 con la pagina "Just a moment..." di Cloudflare: non è il token, è la
+    protezione anti-bot davanti a CardTrader che blocca la richiesta."""
+    r = getattr(errore, "response", None)
+    return r is not None and (r.headers.get("cf-mitigated") or "text/html" in r.headers.get("content-type", ""))
+
+
+def messaggio_rifiuto(errore):
+    if bloccato_da_cloudflare(errore):
+        return ("CardTrader blocca le richieste dai server di GitHub (verifica anti-bot di Cloudflare, "
+                "il token non c'entra): i prezzi non si aggiornano finché il blocco resta.")
+    return (f"CardTrader rifiuta il token (errore {errore.response.status_code}): "
+            f"i prezzi non si aggiornano. Controlla il secret CARDTRADER_TOKEN su GitHub.")
+
+
 def descrizione_dettagli(d):
     return f"{d['condizione']}, {d['lingua'].upper()}, {'foil' if d['foil'] else 'non foil'}, {d['espansione']}"
 
@@ -412,11 +427,10 @@ def main():
         if not token_rifiutato(e):
             raise
         token_ok = False
-        meta["errore_globale"] = (f"CardTrader rifiuta il token (errore {e.response.status_code}): "
-                                  f"i prezzi non si aggiornano. Controlla il secret CARDTRADER_TOKEN su GitHub.")
+        meta["errore_globale"] = messaggio_rifiuto(e)
         print(meta["errore_globale"])
         if not cache.meta.get("allarme_token"):
-            avvisi.invia(f"🔒 <b>{meta['errore_globale']}</b>", "🔒 CardTrader rifiuta il token",
+            avvisi.invia(f"🔒 <b>{meta['errore_globale']}</b>", "🔒 CardTrader non risponde ai controlli",
                          meta["errore_globale"], "/", "token-cardtrader")
             cache.meta["allarme_token"] = True
     if token_ok and cache.meta.get("allarme_token"):
@@ -548,7 +562,7 @@ def main():
 
         except Exception as e:
             if token_rifiutato(e):
-                meta["errore_globale"] = "CardTrader ha rifiutato il token durante il controllo: controlla CARDTRADER_TOKEN."
+                meta["errore_globale"] = messaggio_rifiuto(e)
                 print(meta["errore_globale"])
                 break
             # un problema su una carta non blocca le altre
