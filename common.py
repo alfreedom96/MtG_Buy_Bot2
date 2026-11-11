@@ -61,7 +61,7 @@ SOGLIA_FALLIMENTI_CONSECUTIVI = 10  # dopo quanti fallimenti di fila avvisare
 N_OFFERTE_RIFERIMENTO = 10  # occasione: confronto con la media delle N offerte più economiche
 FATTORE_FUORI_SCALA = 1.5  # occasione: escluse le offerte oltre 1,5 volte la mediana delle 10 più economiche
 SOGLIA_RIBASSO_PREDEFINITA = 5.0
-INTERVALLO_MERCATO = 0.25  # secondi tra due richieste al mercato: il limite reale è 10 al secondo (verificato il 7/11/2026), ne uso 4
+INTERVALLO_MERCATO = 0.17  # secondi tra due richieste al mercato: il limite reale è 10 al secondo (verificato il 7/11/2026), ne uso 6
 ORE_MEMORIA_OFFERTE = 2  # offerte non restituite da CardTrader restano valide per 2 ore
 SOGLIA_RIALZO_PREDEFINITA = 15.0  # avviso impennata: +15% ...
 GIORNI_RIALZO = 3                 # ... rispetto ai 3 giorni precedenti
@@ -357,21 +357,43 @@ class CardTraderClient:
             time.sleep(attesa)
         self._ultima_richiesta_mercato = time.time()
 
-    def offerte_blueprint(self, blueprint_id, lingue=("it", "en"), rileggi=False):
-        """Offerte di una scheda prodotto nelle lingue indicate (ogni finitura):
-        una richiesta per lingua. Nello stesso giro la risposta viene riusata
-        dalle altre varianti della stessa carta; rileggi=True la chiede di nuovo.
-        La richiesta senza filtro di lingua NON va usata: CardTrader la serve da
-        una copia in memoria (cache) che può essere vecchia di molte ore."""
+    def _richiesta(self, blueprint_id, rileggi=False, **filtri):
         if not hasattr(self, "_offerte_cache"):
             self._offerte_cache = {}
-        prodotti = []
-        for lingua in lingue:
-            chiave = (blueprint_id, lingua)
-            if rileggi or chiave not in self._offerte_cache:
-                self._offerte_cache[chiave] = self.marketplace_products(blueprint_id, language=lingua)
-            prodotti.extend(self._offerte_cache[chiave])
-        return prodotti
+        chiave = (blueprint_id, tuple(sorted(filtri.items())))
+        if rileggi or chiave not in self._offerte_cache:
+            self._offerte_cache[chiave] = self.marketplace_products(blueprint_id, **filtri)
+        return self._offerte_cache[chiave]
+
+    def offerte_blueprint(self, blueprint_id, lingue=("it", "en"), rileggi=False):
+        """Offerte di una scheda prodotto nelle lingue indicate (ogni finitura).
+
+        CardTrader serve le risposte da copie in memoria (cache), una per ogni
+        combinazione di filtri, e alcune restano ferme anche per molte ore
+        (offerte nuove assenti, prezzi vecchi). Nessun parametro le aggira.
+        Chiedo quindi le stesse offerte in tre modi diversi (per lingua, per
+        finitura, senza filtri) e tengo la risposta più recente: quella che
+        contiene l'offerta messa in vendita per ultima (numero più alto).
+        Nello stesso giro le risposte vengono riusate dalle altre varianti."""
+        def nelle_lingue(prodotti):
+            visti, out = set(), []
+            for p in prodotti:
+                if p.get("id") in visti:
+                    continue
+                visti.add(p.get("id"))
+                if str((p.get("properties_hash") or {}).get("mtg_language") or "").lower() in lingue:
+                    out.append(p)
+            return out
+        candidati = {
+            "lingua": nelle_lingue([p for l in lingue for p in self._richiesta(blueprint_id, rileggi, language=l)]),
+            "finitura": nelle_lingue([p for f in (True, False) for p in self._richiesta(blueprint_id, rileggi, foil=f)]),
+            "senza_filtri": nelle_lingue(self._richiesta(blueprint_id, rileggi)),
+        }
+        def recente(nome):
+            return max((p.get("id") or 0 for p in candidati[nome]), default=0)
+        scelta = max(candidati, key=lambda n: (recente(n), n == "lingua"))
+        self.ultima_scelta = scelta
+        return candidati[scelta]
 
 
 # ---------------------------------------------------------------------------
@@ -594,7 +616,7 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
             RICHIESTE_FALLITE[str(risposta.status_code) if risposta is not None else "rete"] += 1
             ricerche_fallite += 1
             continue
-        ricerche.append(["+".join(lingue), "tutte", len(prodotti)])
+        ricerche.append(["+".join(lingue), getattr(ct_client, "ultima_scelta", "?"), len(prodotti)])
 
         for p in prodotti:
             props = p.get("properties_hash", {}) or {}
