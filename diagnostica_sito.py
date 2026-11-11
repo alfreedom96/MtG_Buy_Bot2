@@ -1,36 +1,24 @@
-"""Diagnostica una tantum: quali varianti della richiesta (equivalenti come
-risultato) ottengono una risposta nuova invece della copia in cache?"""
-import json, os, time, requests
+"""Diagnostica una tantum: le chiavi non più richieste da un po' si rinnovano?"""
+import hashlib, json, os, time, requests
 H = {"Authorization": f"Bearer {os.environ['CARDTRADER_TOKEN']}"}
 U = "https://api.cardtrader.com/api/v2/marketplace/products"
-VEND = ("Packfresh", "Selvi54tcg", "Ventura Games", "Hometown Games", "Alphastrikegames")
-VARIANTI = [
-    ("en", "blueprint_id=420697&language=en"),
-    ("EN", "blueprint_id=420697&language=EN"),
-    ("En", "blueprint_id=420697&language=En"),
-    ("eN", "blueprint_id=420697&language=eN"),
-    ("zero_davanti", "blueprint_id=0420697&language=en"),
-    ("due_zeri", "blueprint_id=00420697&language=en"),
-    ("piu", "blueprint_id=%2B420697&language=en"),
-    ("ordine_inverso", "language=en&blueprint_id=420697"),
-    ("doppio", "blueprint_id=420697&blueprint_id=420697&language=en"),
-    ("foil_false", "blueprint_id=420697&language=en&foil=false"),
-    ("foil_0", "blueprint_id=420697&language=en&foil=0"),
-    ("foil_False", "blueprint_id=420697&language=en&foil=False"),
-    ("zero_davanti_2", "blueprint_id=0420697&language=en"),
-    ("tre_zeri_ts", "blueprint_id=000420697&language=en"),
-]
-out = []
-for nome, q in VARIANTI:
-    r = requests.get(f"{U}?{q}", headers=H, timeout=30)
-    e = {"variante": nome, "stato": r.status_code, "rt": r.headers.get("x-runtime")}
-    if r.ok:
-        ps = [p for l in r.json().values() for p in l]
-        e["n"] = len(ps)
-        e["v"] = {p["user"]["username"][:8]: [p["price_cents"], p["quantity"]] for p in sorted(ps, key=lambda p: -p["price_cents"])
-                  if p["user"]["username"] in VEND}
-    else:
-        e["testo"] = r.text[:150]
-    out.append(e)
-    time.sleep(0.5)
-json.dump(out, open("data/diag_varianti.json", "w"), ensure_ascii=False, indent=1)
+CHIAVI = [("EN_nf_1min", {"language": "EN", "foil": "false"}), ("EN_f_5min", {"language": "EN", "foil": "true"}),
+          ("IT_nf_10min", {"language": "IT", "foil": "false"}), ("IT_f_20min", {"language": "IT", "foil": "true"}),
+          ("senza_filtri_1min", {})]
+out = {"ora": time.strftime("%H:%M:%S"), "righe": []}
+for nome, extra in CHIAVI:
+    for bp in (23962, 13700, 23490):
+        r = requests.get(U, headers=H, params={"blueprint_id": bp, **extra}, timeout=30)
+        ps = sorted((p["id"], p["price_cents"], p["quantity"]) for l in r.json().values() for p in l)
+        out["righe"].append({"k": nome, "bp": bp, "rt": float(r.headers.get("x-runtime") or 0), "n": len(ps),
+                             "h": hashlib.md5(json.dumps(ps).encode()).hexdigest()[:8], "max_id": max(p[0] for p in ps) if ps else None})
+        time.sleep(0.4)
+for nome, extra in [("vault_en", {"language": "en"}), ("vault_en_nf", {"language": "en", "foil": "false"}),
+                    ("vault_en_f", {"language": "en", "foil": "true"})]:
+    r = requests.get(U, headers=H, params={"blueprint_id": 420697, **extra}, timeout=30)
+    ps = [p for l in r.json().values() for p in l]
+    out["righe"].append({"k": nome, "rt": r.headers.get("x-runtime"), "n": len(ps),
+                         "packfresh": [p["price_cents"] for p in ps if p["user"]["username"] == "Packfresh"],
+                         "max_id": max((p["id"] for p in ps), default=None)})
+    time.sleep(0.4)
+json.dump(out, open("data/diag_inattive.json", "w"), indent=1)
