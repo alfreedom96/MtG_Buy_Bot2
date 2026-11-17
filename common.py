@@ -62,6 +62,7 @@ N_OFFERTE_RIFERIMENTO = 10  # occasione: confronto con la media delle N offerte 
 FATTORE_FUORI_SCALA = 1.5  # occasione: escluse le offerte oltre 1,5 volte la mediana delle 10 più economiche
 SOGLIA_RIBASSO_PREDEFINITA = 5.0
 INTERVALLO_MERCATO = 0.5  # secondi tra due richieste al mercato (2 al secondo): carico ridotto dopo il blocco dell'11/11/2026
+N_OFFERTE_DA_CONFERMARE = 3  # le 3 offerte più economiche vanno confermate da una seconda richiesta
 ORE_MEMORIA_OFFERTE = 2  # offerte non restituite da CardTrader restano valide per 2 ore
 SOGLIA_RIALZO_PREDEFINITA = 15.0  # avviso impennata: +15% ...
 GIORNI_RIALZO = 3                 # ... rispetto ai 3 giorni precedenti
@@ -371,10 +372,9 @@ class CardTraderClient:
         CardTrader serve le risposte da copie in memoria (cache), una per ogni
         combinazione di filtri, e alcune restano ferme anche per molte ore
         (offerte nuove assenti, prezzi vecchi). Nessun parametro le aggira.
-        Chiedo quindi le stesse offerte in tre modi diversi (per lingua, per
-        finitura, senza filtri) e tengo la risposta più recente: quella che
-        contiene l'offerta messa in vendita per ultima (numero più alto).
-        Nello stesso giro le risposte vengono riusate dalle altre varianti."""
+        Qui uso le richieste per lingua; le offerte più economiche vengono poi
+        controllate con offerta_confermata(). Nello stesso giro le risposte
+        vengono riusate dalle altre varianti."""
         def nelle_lingue(prodotti):
             visti, out = set(), []
             for p in prodotti:
@@ -388,6 +388,18 @@ class CardTraderClient:
         # (dall'11/11/2026 bloccano le richieste dai server di GitHub).
         self.ultima_scelta = "lingua"
         return nelle_lingue([p for l in lingue for p in self._richiesta(blueprint_id, rileggi, language=l)])
+
+    def offerta_confermata(self, blueprint_id, product_id, foil):
+        """L'offerta compare anche in una richiesta fatta in un altro modo (per
+        finitura, poi senza filtri)? Le copie in cache di CardTrader possono
+        contenere offerte già vendute: un'offerta presente in due copie diverse
+        è molto probabilmente ancora in vendita."""
+        try:
+            if any(p.get("id") == product_id for p in self._richiesta(blueprint_id, foil=bool(foil))):
+                return True
+            return any(p.get("id") == product_id for p in self._richiesta(blueprint_id))
+        except requests.RequestException:
+            return True  # la verifica non risponde: non scarto l'offerta
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +712,21 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
             return False
     dal_precedente = [dict(o, dal_controllo_precedente=True) for o in (precedenti or [])
                       if o.get("product_id") not in ids_ora and recente(o)]
+    # Le offerte più economiche devono comparire anche in una seconda richiesta
+    # fatta in un altro modo: le copie in cache di CardTrader possono mostrare
+    # offerte già vendute anche per ore.
+    candidate = sorted(raccolte + dal_precedente, key=lambda o: o["prezzo"])
+    non_confermate, confermate = set(), 0
+    for o in candidate[:N_OFFERTE_DA_CONFERMARE * 3]:
+        if confermate >= N_OFFERTE_DA_CONFERMARE:
+            break
+        if ct_client.offerta_confermata(o["blueprint_id"], o["product_id"], o["foil"]):
+            confermate += 1
+        else:
+            non_confermate.add(o["product_id"])
+            OFFERTE_SCARTATE["non confermata da una seconda richiesta"] += 1
+    raccolte = [o for o in raccolte if o["product_id"] not in non_confermate]
+    dal_precedente = [o for o in dal_precedente if o["product_id"] not in non_confermate]
     risultato = riassumi_offerte(raccolte + dal_precedente)
     if risultato is None:
         if miglior_altre_condizioni:
@@ -713,6 +740,7 @@ def miglior_prezzo(ct_client, nome_carta, lingua_richiesta, foil_richiesto, escl
     prezzo, dettagli, numero = risultato
     dettagli["ricerche"] = ricerche
     dettagli["aggiunte_dal_precedente"] = len(dal_precedente)
+    dettagli["non_confermate"] = len(non_confermate)
     # da salvare per il prossimo giro: solo quelle viste ADESSO (così un'offerta
     # sparita resta al massimo un controllo in più), le 40 più economiche
     # per il prossimo giro: le offerte viste adesso più quelle ancora in memoria
