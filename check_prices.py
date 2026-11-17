@@ -96,6 +96,13 @@ def token_rifiutato(errore):
     )
 
 
+MINUTI_PAUSA_BLOCCO = 60
+
+
+class PausaBlocco(Exception):
+    """Controllo saltato: CardTrader ci ha bloccati da poco."""
+
+
 def bloccato_da_cloudflare(errore):
     """403 con la pagina "Just a moment..." di Cloudflare: non è il token, è la
     protezione anti-bot davanti a CardTrader che blocca la richiesta."""
@@ -420,14 +427,28 @@ def main():
           f"avvisi: app {'sì' if fonte == 'app' else 'no'}, Telegram {'sì' if avvisi.telegram else 'no'}")
 
     # --- Il token CardTrader funziona? Se no: un solo avviso, non uno per carta ---
+    # Se CardTrader ci ha bloccati (verifica anti-bot), per un'ora non lo interrogo
+    # nemmeno: insistere ogni pochi minuti rischia di allungare il blocco.
+    pausa = cache.meta.get("pausa_fino") or 0
     try:
+        if time.time() < pausa:
+            raise PausaBlocco()
         ct_client.espansioni_magic()
         token_ok = True
+        cache.meta.pop("pausa_fino", None)
+    except PausaBlocco:
+        token_ok = False
+        meta["errore_globale"] = (cache.meta.get("ultimo_blocco") or "CardTrader blocca le richieste.") + \
+            f" Nuovo tentativo dopo le {datetime.fromtimestamp(pausa, timezone.utc).strftime('%H:%M')} UTC."
+        print(meta["errore_globale"])
     except requests.HTTPError as e:
         if not token_rifiutato(e):
             raise
         token_ok = False
         meta["errore_globale"] = messaggio_rifiuto(e)
+        if bloccato_da_cloudflare(e):
+            cache.meta["pausa_fino"] = time.time() + MINUTI_PAUSA_BLOCCO * 60
+            cache.meta["ultimo_blocco"] = meta["errore_globale"]
         print(meta["errore_globale"])
         if not cache.meta.get("allarme_token"):
             avvisi.invia(f"🔒 <b>{meta['errore_globale']}</b>", "🔒 CardTrader non risponde ai controlli",
@@ -563,6 +584,9 @@ def main():
         except Exception as e:
             if token_rifiutato(e):
                 meta["errore_globale"] = messaggio_rifiuto(e)
+                if bloccato_da_cloudflare(e):
+                    cache.meta["pausa_fino"] = time.time() + MINUTI_PAUSA_BLOCCO * 60
+                    cache.meta["ultimo_blocco"] = meta["errore_globale"]
                 print(meta["errore_globale"])
                 break
             # un problema su una carta non blocca le altre
