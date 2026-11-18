@@ -17,9 +17,15 @@ def chiedi(nome, bp, foil, giro):
         log.append(e)
         return
     e.update(stato=r.status_code, rt=r.headers.get("x-runtime"), server=r.headers.get("X-Server-Name"))
-    if r.ok:
-        ps = sorted((p["id"], p["price_cents"], p["quantity"]) for l in r.json().values() for p in l)
-        e.update(n=len(ps), h=hashlib.md5(json.dumps(ps).encode()).hexdigest()[:8], max_id=max((p[0] for p in ps), default=0))
+    try:
+        if r.ok:
+            ps = sorted((p.get("id") or 0, p.get("price_cents") or 0, p.get("quantity") or 0)
+                        for l in r.json().values() if isinstance(l, list) for p in l if isinstance(p, dict))
+            e.update(n=len(ps), h=hashlib.md5(json.dumps(ps).encode()).hexdigest()[:8], max_id=max((p[0] for p in ps), default=0))
+        else:
+            e["testo"] = r.text[:120]
+    except Exception as err:
+        e["errore_lettura"] = f"{type(err).__name__}: {err}"[:200]
     log.append(e)
     time.sleep(0.3)
 for giro in range(37):  # 0..180 minuti
